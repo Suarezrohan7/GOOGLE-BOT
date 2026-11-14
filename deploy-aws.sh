@@ -30,10 +30,35 @@ if ! command -v node >/dev/null 2>&1 || [ "$(node -v | cut -d. -f1 | tr -d v)" -
 fi
 echo "Node version: $(node -v)"
 
-# 3. Verify .env exists
+# 3. Auto-create .env if missing (accepts env vars or interactive prompts)
 if [ ! -f "$APP_DIR/.env" ]; then
-  echo "[3/6] Creating template .env from .env.example (PLEASE FILL IN YOUR KEYS)..."
-  cp "$APP_DIR/.env.example" "$APP_DIR/.env"
+  echo "[3/6] Creating .env..."
+  API_KEY="${UPSTOX_API_KEY:-}"
+  API_SECRET="${UPSTOX_API_SECRET:-}"
+  NTFY="${NTFY_TOPIC:-}"
+  PUBLIC_HOST="${PUBLIC_IP:-3.110.6.180}"
+
+  if [ -z "$API_KEY" ]; then
+    read -r -p "Enter UPSTOX_API_KEY: " API_KEY
+  fi
+  if [ -z "$API_SECRET" ]; then
+    read -r -p "Enter UPSTOX_API_SECRET: " API_SECRET
+  fi
+  if [ -z "$NTFY" ]; then
+    read -r -p "Enter your ntfy topic (e.g. GoogleBot_Rohan8492): " NTFY
+  fi
+
+  cat > "$APP_DIR/.env" <<EOF
+PORT=3000
+APP_URL="http://${PUBLIC_HOST}:3000"
+UPSTOX_API_KEY="${API_KEY}"
+UPSTOX_API_SECRET="${API_SECRET}"
+UPSTOX_REDIRECT_URI="http://${PUBLIC_HOST}:3000/api/upstox/callback"
+UPSTOX_ACCESS_TOKEN=""
+UPSTOX_PUBLIC_WEBHOOK="false"
+NTFY_TOPIC="${NTFY}"
+GEMINI_API_KEY=""
+EOF
 else
   echo "[3/6] Found existing .env."
 fi
@@ -73,10 +98,12 @@ sudo systemctl daemon-reload
 sudo systemctl enable artha-quant
 sudo systemctl restart artha-quant
 
-# 6. Verify live health
-echo "[6/6] Verifying server health..."
-sleep 2
+# 6. Verify live health & fire phone alert
+echo "[6/6] Verifying server health & phone notification..."
+sleep 3
 curl -s http://127.0.0.1:3000/api/health || true
+echo ""
+curl -s -X POST http://127.0.0.1:3000/api/alerts/test || true
 echo ""
 echo "=== DONE! Artha Quant is running 24/7 even when your laptop is OFF. ==="
 echo "Check status : sudo systemctl status artha-quant"

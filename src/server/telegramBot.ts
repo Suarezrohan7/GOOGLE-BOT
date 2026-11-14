@@ -1,39 +1,24 @@
 /**
- * Lightweight Multi-Channel Phone Notifier & 2-Way Command Poller (zero external dependencies).
- * Supports:
- * 1. ntfy.sh (ZERO BotFather / ZERO account / instant iOS & Android push + 2-way /commands)
- * 2. Discord Webhook (DISCORD_WEBHOOK_URL)
- * 3. Telegram Bot (TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID)
+ * Lightweight Phone Notifier & 2-Way Command Poller over ntfy.sh (zero external dependencies).
+ * Configured via server-side environment variable: NTFY_TOPIC (uses https://ntfy.sh automatically).
  */
 
-let lastUpdateOffset = 0;
 let ntfySinceEpochSec = Math.floor(Date.now() / 1000) - 5;
 const seenNtfyIds = new Set<string>();
+const NTFY_BASE_URL = 'https://ntfy.sh';
 
 export interface AlertChannelStatus {
   ntfy: boolean;
-  discord: boolean;
-  telegram: boolean;
 }
 
 export function getAlertChannelStatus(): AlertChannelStatus {
   return {
     ntfy: Boolean(process.env.NTFY_TOPIC?.trim()),
-    discord: Boolean(process.env.DISCORD_WEBHOOK_URL?.trim()),
-    telegram: Boolean(
-      process.env.TELEGRAM_BOT_TOKEN?.trim() && process.env.TELEGRAM_CHAT_ID?.trim()
-    ),
   };
 }
 
 export function isTelegramConfigured(): boolean {
-  const status = getAlertChannelStatus();
-  return status.ntfy || status.discord || status.telegram;
-}
-
-function getNtfyBaseUrl(): string {
-  const raw = (process.env.NTFY_SERVER || 'https://ntfy.sh').trim().replace(/\/$/, '');
-  return raw || 'https://ntfy.sh';
+  return Boolean(process.env.NTFY_TOPIC?.trim());
 }
 
 function inferNtfyMeta(message: string): { title: string; priority: string; tags: string } {
@@ -53,13 +38,16 @@ function inferNtfyMeta(message: string): { title: string; priority: string; tags
   return { title: 'Artha Quant', priority: '3', tags: 'moneybag' };
 }
 
-async function sendNtfyAlert(message: string, topicOverride?: string): Promise<boolean> {
-  const topic = (topicOverride ?? process.env.NTFY_TOPIC ?? '').trim();
+export async function sendTelegramAlert(
+  message: string,
+  options?: { ntfyTopicOverride?: string }
+): Promise<boolean> {
+  const topic = (options?.ntfyTopicOverride ?? process.env.NTFY_TOPIC ?? '').trim();
   if (!topic) return false;
 
   const meta = inferNtfyMeta(message);
   try {
-    const resp = await fetch(`${getNtfyBaseUrl()}/${encodeURIComponent(topic)}`, {
+    const resp = await fetch(`${NTFY_BASE_URL}/${encodeURIComponent(topic)}`, {
       method: 'POST',
       headers: {
         'Content-Type': 'text/plain; charset=utf-8',
@@ -76,70 +64,14 @@ async function sendNtfyAlert(message: string, topicOverride?: string): Promise<b
   }
 }
 
-async function sendDiscordAlert(message: string): Promise<boolean> {
-  const webhookUrl = process.env.DISCORD_WEBHOOK_URL?.trim();
-  if (!webhookUrl) return false;
-
-  try {
-    const resp = await fetch(webhookUrl, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        content: message.slice(0, 1950),
-      }),
-      signal: AbortSignal.timeout(6000),
-    });
-    return resp.ok;
-  } catch {
-    return false;
-  }
-}
-
-async function sendTelegramOnly(message: string): Promise<boolean> {
-  const token = process.env.TELEGRAM_BOT_TOKEN?.trim();
-  const chatId = process.env.TELEGRAM_CHAT_ID?.trim();
-  if (!token || !chatId) return false;
-
-  try {
-    const resp = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        chat_id: chatId,
-        text: message,
-        disable_web_page_preview: true,
-      }),
-      signal: AbortSignal.timeout(6000),
-    });
-    return resp.ok;
-  } catch {
-    return false;
-  }
-}
-
-/**
- * Broadcasts alert to all configured mobile channels (ntfy.sh, Discord, Telegram).
- */
-export async function sendTelegramAlert(
-  message: string,
-  options?: { ntfyTopicOverride?: string }
-): Promise<boolean> {
-  const results = await Promise.all([
-    sendNtfyAlert(message, options?.ntfyTopicOverride),
-    sendDiscordAlert(message),
-    sendTelegramOnly(message),
-  ]);
-  return results.some(Boolean);
-}
-
-async function pollNtfyCommands(
+export async function pollTelegramCommands(
   onCommand: (cmd: string, argsText: string) => Promise<string>
 ): Promise<void> {
   const topic = process.env.NTFY_TOPIC?.trim();
   if (!topic) return;
 
   try {
-    const url = `${getNtfyBaseUrl()}/${encodeURIComponent(
+    const url = `${NTFY_BASE_URL}/${encodeURIComponent(
       topic
     )}/json?poll=1&since=${ntfySinceEpochSec}`;
     const resp = await fetch(url, { signal: AbortSignal.timeout(5000) });
@@ -185,62 +117,10 @@ async function pollNtfyCommands(
       const reply = await onCommand(cmd, argsText);
       if (reply) {
         const safeReply = reply.startsWith('/') ? `ARTHA QUANT:\n${reply}` : reply;
-        await sendNtfyAlert(safeReply);
+        await sendTelegramAlert(safeReply);
       }
     }
   } catch {
     // Non-fatal; never interrupt trading loop
   }
-}
-
-async function pollTelegramOnly(
-  onCommand: (cmd: string, argsText: string) => Promise<string>
-): Promise<void> {
-  const token = process.env.TELEGRAM_BOT_TOKEN?.trim();
-  const allowedChatId = process.env.TELEGRAM_CHAT_ID?.trim();
-  if (!token || !allowedChatId) return;
-
-  try {
-    const url = `https://api.telegram.org/bot${token}/getUpdates?offset=${
-      lastUpdateOffset + 1
-    }&limit=10&timeout=0`;
-    const resp = await fetch(url, { signal: AbortSignal.timeout(5000) });
-    if (!resp.ok) return;
-    const json = (await resp.json()) as {
-      ok?: boolean;
-      result?: Array<{
-        update_id: number;
-        message?: { chat?: { id?: number | string }; text?: string };
-      }>;
-    };
-    if (!json.ok || !Array.isArray(json.result)) return;
-
-    for (const upd of json.result) {
-      if (upd.update_id > lastUpdateOffset) {
-        lastUpdateOffset = upd.update_id;
-      }
-      const msgChatId = String(upd.message?.chat?.id ?? '');
-      const rawText = (upd.message?.text ?? '').trim();
-      if (msgChatId !== allowedChatId || !rawText.startsWith('/')) continue;
-
-      const spaceIdx = rawText.search(/\s/);
-      const cmd = (spaceIdx === -1 ? rawText : rawText.slice(0, spaceIdx))
-        .split('@')[0]
-        .toLowerCase();
-      const argsText = spaceIdx === -1 ? '' : rawText.slice(spaceIdx + 1).trim();
-
-      const reply = await onCommand(cmd, argsText);
-      if (reply) {
-        await sendTelegramOnly(reply);
-      }
-    }
-  } catch {
-    // Non-fatal; never interrupt trading loop
-  }
-}
-
-export async function pollTelegramCommands(
-  onCommand: (cmd: string, argsText: string) => Promise<string>
-): Promise<void> {
-  await Promise.all([pollNtfyCommands(onCommand), pollTelegramOnly(onCommand)]);
 }

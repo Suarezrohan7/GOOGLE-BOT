@@ -57,8 +57,7 @@ async function startServer(): Promise<void> {
       res.status(400).json({
         ok: false,
         channels: getAlertChannelStatus(),
-        error:
-          'Configure NTFY_TOPIC (no BotFather needed), DISCORD_WEBHOOK_URL, or TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID.',
+        error: 'Set NTFY_TOPIC in server .env / Secrets to receive mobile push notifications.',
       });
       return;
     }
@@ -77,15 +76,14 @@ async function startServer(): Promise<void> {
         snap.upstoxLiveBalanceInr !== null
           ? `₹${snap.upstoxLiveBalanceInr.toLocaleString('en-IN')}`
           : 'Syncing / Token Required'
-      }\nServer: ${health.rssMb} MB RSS | CPU Load: ${health.cpuLoadPct}% (${health.cpuCount} vCPU)\nCommands: /status /balance /login /code /pause /resume /kill`,
+      }\nServer: ${health.rssMb} MB RSS | CPU Load: ${health.cpuLoadPct}% (${health.cpuCount} vCPU)\nCommands: /status /balance /health /login /code /pause /resume /kill`,
       { ntfyTopicOverride }
     );
     if (!sent) {
       res.status(400).json({
         ok: false,
         channels: getAlertChannelStatus(),
-        error:
-          'Set NTFY_TOPIC (zero BotFather), DISCORD_WEBHOOK_URL, or TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID in server .env.',
+        error: 'Set NTFY_TOPIC in server .env / Secrets to receive mobile push notifications.',
       });
       return;
     }
