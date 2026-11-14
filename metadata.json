@@ -1,0 +1,6 @@
+{
+  "name": "Artha Quant — Autonomous NSE Trading & Risk Engine",
+  "description": "Survival-first autonomous quantitative trading engine and hard risk control plane for the Indian equity market (NSE/BSE), featuring paper simulation, Zerodha Kite / Dhan / Upstox server-side adapters, Indian statutory fee modeling, and automated circuit breakers.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
