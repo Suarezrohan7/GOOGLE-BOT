@@ -22,11 +22,11 @@ fi
 
 # 2. Ensure base tools & Node.js 22 LTS are installed (native TypeScript execution -> zero tsx/pm2 RAM overhead)
 echo "[2/6] Checking Node.js 22 LTS..."
-sudo apt-get update -y >/dev/null
-sudo apt-get install -y curl git unzip >/dev/null
+sudo DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a apt-get update -y >/dev/null
+sudo DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a apt-get install -y curl git unzip >/dev/null
 if ! command -v node >/dev/null 2>&1 || [ "$(node -v | cut -d. -f1 | tr -d v)" -lt 22 ]; then
   curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -
-  sudo apt-get install -y nodejs
+  sudo DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a apt-get install -y nodejs
 fi
 echo "Node version: $(node -v)"
 
@@ -45,7 +45,7 @@ if [ ! -f "$APP_DIR/.env" ]; then
     read -r -p "Enter UPSTOX_API_SECRET: " API_SECRET
   fi
   if [ -z "$NTFY" ]; then
-    read -r -p "Enter your ntfy topic (e.g. GoogleBot_Rohan8492): " NTFY
+    read -r -p "Enter your ntfy topic (e.g. google_bot_rohan_8492): " NTFY
   fi
 
   cat > "$APP_DIR/.env" <<EOF
@@ -66,7 +66,7 @@ fi
 # 4. Install dependencies & build static Vite frontend
 echo "[4/6] Installing packages & building frontend (capped for 512 MB RAM)..."
 cd "$APP_DIR"
-npm ci --no-audit --no-fund || npm install --no-audit --no-fund
+npm install --legacy-peer-deps --no-audit --no-fund
 NODE_OPTIONS="--max-old-space-size=384" npm run build
 
 # 5. Create systemd service (0 MB extra daemon overhead vs PM2; auto-starts on boot & crashes)

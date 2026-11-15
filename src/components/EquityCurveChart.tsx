@@ -1,15 +1,31 @@
-import { useState } from 'react';
-import type { EquityPoint } from '../shared/types';
-import { formatInr } from '../utils/format';
+import {
+  Area,
+  AreaChart,
+  CartesianGrid,
+  ReferenceLine,
+  ResponsiveContainer,
+  Tooltip,
+  XAxis,
+  YAxis,
+} from 'recharts';
+import type { EquityPoint, TradeRecord } from '../shared/types';
+import { formatInr, formatSignedInr } from '../utils/format';
 
 interface EquityCurveChartProps {
   points: EquityPoint[];
+  trades?: TradeRecord[];
   height?: number;
 }
 
-export function EquityCurveChart({ points, height = 220 }: EquityCurveChartProps) {
-  const [hoverIdx, setHoverIdx] = useState<number | null>(null);
+interface ChartDatum {
+  label: string;
+  equityInr: number;
+  survivalFloorInr: number;
+  drawdownPct: number;
+  dailyPnlInr: number;
+}
 
+export function EquityCurveChart({ points, trades = [], height = 225 }: EquityCurveChartProps) {
   if (!points || points.length === 0) {
     return (
       <div
@@ -21,54 +37,36 @@ export function EquityCurveChart({ points, height = 220 }: EquityCurveChartProps
     );
   }
 
-  const width = 760;
-  const padLeft = 72;
-  const padRight = 18;
-  const padTop = 16;
-  const padBottom = 24;
-  const plotW = width - padLeft - padRight;
-  const plotH = height - padTop - padBottom;
+  const startEquity = points[0].equityInr;
+  const latestPoint = points[points.length - 1];
+  const isPositive = latestPoint.equityInr >= startEquity;
+  const strokeColor = isPositive ? '#22c55e' : '#ef4444';
 
-  const allValues = points.flatMap((p) => [p.equityInr, p.survivalFloorInr]);
+  // Build Recharts series enriched with realized cumulative daily PnL from trade history
+  const pnlByDay = new Map<string, number>();
+  for (const tr of trades) {
+    const dayKey = new Intl.DateTimeFormat('en-CA', {
+      timeZone: 'Asia/Kolkata',
+      month: 'short',
+      day: '2-digit',
+    }).format(new Date(tr.closedAt));
+    pnlByDay.set(dayKey, (pnlByDay.get(dayKey) ?? 0) + tr.netPnlInr);
+  }
+
+  const data: ChartDatum[] = points.map((p) => ({
+    label: p.label,
+    equityInr: Number(p.equityInr.toFixed(2)),
+    survivalFloorInr: Number(p.survivalFloorInr.toFixed(2)),
+    drawdownPct: Number(p.drawdownPct.toFixed(2)),
+    dailyPnlInr: Number((p.equityInr - startEquity).toFixed(2)),
+  }));
+
+  const allValues = data.flatMap((d) => [d.equityInr, d.survivalFloorInr]);
   const rawMin = Math.min(...allValues);
   const rawMax = Math.max(...allValues);
   const span = Math.max(150, rawMax - rawMin);
-  const minY = rawMin - span * 0.14;
-  const maxY = rawMax + span * 0.14;
-
-  const xFor = (i: number) =>
-    points.length === 1
-      ? padLeft + plotW / 2
-      : padLeft + (i / (points.length - 1)) * plotW;
-
-  const yFor = (val: number) =>
-    padTop + ((maxY - val) / Math.max(1, maxY - minY)) * plotH;
-
-  const equityPath = points
-    .map((p, i) => `${i === 0 ? 'M' : 'L'} ${xFor(i).toFixed(1)} ${yFor(p.equityInr).toFixed(1)}`)
-    .join(' ');
-
-  const floorPath = points
-    .map(
-      (p, i) =>
-        `${i === 0 ? 'M' : 'L'} ${xFor(i).toFixed(1)} ${yFor(p.survivalFloorInr).toFixed(1)}`
-    )
-    .join(' ');
-
-  const areaPath =
-    points.length > 1
-      ? `${equityPath} L ${xFor(points.length - 1).toFixed(1)} ${(padTop + plotH).toFixed(
-          1
-        )} L ${xFor(0).toFixed(1)} ${(padTop + plotH).toFixed(1)} Z`
-      : '';
-
-  const yTicks = [0, 0.25, 0.5, 0.75, 1].map((t) => minY + t * (maxY - minY));
-  const activeIdx = hoverIdx !== null && points[hoverIdx] ? hoverIdx : points.length - 1;
-  const activePoint = points[activeIdx];
-  const latestEquity = points[points.length - 1].equityInr;
-  const startEquity = points[0].equityInr;
-  const isPositive = latestEquity >= startEquity;
-  const strokeColor = isPositive ? '#22c55e' : '#ef4444';
+  const domainMin = Math.max(0, Math.floor(rawMin - span * 0.14));
+  const domainMax = Math.ceil(rawMax + span * 0.14);
 
   return (
     <div className="w-full">
@@ -80,114 +78,90 @@ export function EquityCurveChart({ points, height = 220 }: EquityCurveChartProps
                 isPositive ? 'bg-emerald-500' : 'bg-rose-500'
               }`}
             />
-            Net Equity ({activePoint.label})
+            Daily Equity ({latestPoint.label})
           </span>
           <span className="inline-flex items-center gap-1.5 text-rose-400 font-medium">
             <span className="inline-block w-3 h-0.5 border-t border-dashed border-rose-500" />
-            Survival Floor
+            Survival Floor (25% DD)
           </span>
         </div>
         <div className="font-mono tabular-nums flex items-center gap-2.5 text-slate-300">
-          <span>Eq {formatInr(activePoint.equityInr)}</span>
-          <span aria-hidden="true" className="text-slate-600">·</span>
-          <span className="text-rose-400">Floor {formatInr(activePoint.survivalFloorInr)}</span>
-          <span aria-hidden="true" className="text-slate-600">·</span>
-          <span>DD {activePoint.drawdownPct.toFixed(2)}%</span>
+          <span>Eq {formatInr(latestPoint.equityInr)}</span>
+          <span aria-hidden="true" className="text-slate-600">
+            ·
+          </span>
+          <span className={isPositive ? 'text-emerald-400' : 'text-rose-400'}>
+            {formatSignedInr(latestPoint.equityInr - startEquity)}
+          </span>
+          <span aria-hidden="true" className="text-slate-600">
+            ·
+          </span>
+          <span>DD {latestPoint.drawdownPct.toFixed(2)}%</span>
         </div>
       </div>
 
-      <svg
-        viewBox={`0 0 ${width} ${height}`}
-        className="w-full h-auto select-none overflow-visible"
-        onMouseLeave={() => setHoverIdx(null)}
-      >
-        <defs>
-          <linearGradient id="eqFillDark" x1="0" y1="0" x2="0" y2="1">
-            <stop offset="0%" stopColor={strokeColor} stopOpacity="0.22" />
-            <stop offset="100%" stopColor={strokeColor} stopOpacity="0.01" />
-          </linearGradient>
-        </defs>
-
-        {yTicks.map((val, idx) => {
-          const y = yFor(val);
-          return (
-            <g key={idx}>
-              <line
-                x1={padLeft}
-                y1={y}
-                x2={width - padRight}
-                y2={y}
-                stroke="#1e293b"
-                strokeWidth="1"
+      <div style={{ width: '100%', height }}>
+        <ResponsiveContainer width="100%" height="100%">
+          <AreaChart data={data} margin={{ top: 8, right: 12, left: 4, bottom: 2 }}>
+            <defs>
+              <linearGradient id="arthaEquityFill" x1="0" y1="0" x2="0" y2="1">
+                <stop offset="5%" stopColor={strokeColor} stopOpacity={0.28} />
+                <stop offset="95%" stopColor={strokeColor} stopOpacity={0.02} />
+              </linearGradient>
+            </defs>
+            <CartesianGrid stroke="#1e293b" strokeDasharray="3 3" vertical={false} />
+            <XAxis
+              dataKey="label"
+              stroke="#64748b"
+              tick={{ fill: '#94a3b8', fontSize: 10 }}
+              tickLine={false}
+              axisLine={{ stroke: '#1e293b' }}
+              minTickGap={24}
+            />
+            <YAxis
+              domain={[domainMin, domainMax]}
+              stroke="#64748b"
+              tick={{ fill: '#94a3b8', fontSize: 10 }}
+              tickLine={false}
+              axisLine={false}
+              width={62}
+              tickFormatter={(v: number) => formatInr(v, true)}
+            />
+            <Tooltip
+              contentStyle={{
+                backgroundColor: '#070B12',
+                border: '1px solid #334155',
+                borderRadius: '6px',
+                fontSize: '11px',
+                color: '#e2e8f0',
+              }}
+              formatter={(value, name) => {
+                const numericVal = typeof value === 'number' ? value : Number(value ?? 0);
+                if (name === 'equityInr') return [formatInr(numericVal), 'Equity'];
+                if (name === 'survivalFloorInr') return [formatInr(numericVal), 'Survival Floor'];
+                return [formatInr(numericVal), String(name ?? '')];
+              }}
+              labelFormatter={(lbl) => `IST ${lbl}`}
+            />
+            {latestPoint.survivalFloorInr > 0 && (
+              <ReferenceLine
+                y={latestPoint.survivalFloorInr}
+                stroke="#ef4444"
+                strokeDasharray="4 4"
+                strokeWidth={1.3}
               />
-              <text
-                x={padLeft - 8}
-                y={y + 4}
-                textAnchor="end"
-                className="fill-slate-400 text-[10px] font-mono"
-              >
-                {formatInr(val, true)}
-              </text>
-            </g>
-          );
-        })}
-
-        {areaPath && <path d={areaPath} fill="url(#eqFillDark)" />}
-
-        <path
-          d={floorPath}
-          fill="none"
-          stroke="#ef4444"
-          strokeWidth="1.4"
-          strokeDasharray="4 4"
-        />
-
-        <path
-          d={equityPath}
-          fill="none"
-          stroke={strokeColor}
-          strokeWidth="2.2"
-          strokeLinejoin="round"
-        />
-
-        {points.map((p, i) => {
-          const cx = xFor(i);
-          const cy = yFor(p.equityInr);
-          return (
-            <g key={i}>
-              <rect
-                x={cx - plotW / Math.max(10, points.length * 2)}
-                y={padTop}
-                width={plotW / Math.max(5, points.length)}
-                height={plotH}
-                fill="transparent"
-                onMouseEnter={() => setHoverIdx(i)}
-              />
-              {i === activeIdx && (
-                <>
-                  <line
-                    x1={cx}
-                    y1={padTop}
-                    x2={cx}
-                    y2={padTop + plotH}
-                    stroke="#475569"
-                    strokeWidth="1"
-                    strokeDasharray="2 2"
-                  />
-                  <circle
-                    cx={cx}
-                    cy={cy}
-                    r="4"
-                    fill="#070B12"
-                    stroke={strokeColor}
-                    strokeWidth="2"
-                  />
-                </>
-              )}
-            </g>
-          );
-        })}
-      </svg>
+            )}
+            <Area
+              type="monotone"
+              dataKey="equityInr"
+              stroke={strokeColor}
+              strokeWidth={2.2}
+              fill="url(#arthaEquityFill)"
+              isAnimationActive={false}
+            />
+          </AreaChart>
+        </ResponsiveContainer>
+      </div>
     </div>
   );
 }

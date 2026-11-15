@@ -32,6 +32,11 @@ async function startServer(): Promise<void> {
     res.json(engine.getSnapshot());
   });
 
+  app.get('/api/trades/history', (req, res) => {
+    const limit = Math.min(500, Math.max(10, Number(req.query.limit || 250)));
+    res.json({ trades: engine.getTradeHistory(limit) });
+  });
+
   app.get('/api/health', (_req, res) => {
     res.json(engine.getSystemHealth());
   });
@@ -250,9 +255,17 @@ async function startServer(): Promise<void> {
       return;
     }
 
+    engine.markTokenApprovedToday();
     await engine.syncUpstoxAccountAndQuotes();
     engine.resumeAutonomous();
-    void sendTelegramAlert('Upstox 24h access token refreshed via OAuth login. Engine armed.');
+    const afterCallback = engine.getSnapshot();
+    const balCallbackStr =
+      afterCallback.upstoxLiveBalanceInr !== null
+        ? `₹${afterCallback.upstoxLiveBalanceInr.toLocaleString('en-IN')}`
+        : 'Synced';
+    void sendTelegramAlert(
+      `UPSTOX CONNECTED (OAuth Login)\nLive Balance: ${balCallbackStr}\nStatus: ${afterCallback.status}`
+    );
     res.redirect('/');
   });
 
@@ -263,6 +276,10 @@ async function startServer(): Promise<void> {
       return;
     }
     res.json(result);
+  });
+
+  app.get('/api/upstox/notifier-webhook', (_req, res) => {
+    res.status(200).json({ ok: true, status: 'upstox_notifier_ready' });
   });
 
   app.post('/api/upstox/notifier-webhook', async (req, res) => {
@@ -287,9 +304,17 @@ async function startServer(): Promise<void> {
       return;
     }
     saveUpstoxAccessToken(cleanToken);
+    engine.markTokenApprovedToday();
     await engine.syncUpstoxAccountAndQuotes();
     engine.resumeAutonomous();
-    void sendTelegramAlert('Upstox 24h access token received via WhatsApp/App approval! Live bot armed.');
+    const afterWebhook = engine.getSnapshot();
+    const balWebhookStr =
+      afterWebhook.upstoxLiveBalanceInr !== null
+        ? `₹${afterWebhook.upstoxLiveBalanceInr.toLocaleString('en-IN')}`
+        : 'Synced';
+    void sendTelegramAlert(
+      `UPSTOX WHATSAPP APPROVED!\nLive Balance: ${balWebhookStr}\nStatus: ${afterWebhook.status}`
+    );
     res.status(200).json({ ok: true, status: 'token_received' });
   });
 

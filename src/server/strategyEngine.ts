@@ -43,6 +43,7 @@ import {
   saveUpstoxAccessToken,
 } from './upstoxClient.ts';
 import { pollTelegramCommands, sendTelegramAlert } from './telegramBot.ts';
+import { getCachedMarketNewsDigest, refreshMarketNewsDigest } from './newsFeed.ts';
 
 interface StockMeta {
   symbol: string;
@@ -68,11 +69,11 @@ const NSE_UNIVERSE: StockMeta[] = [
 const DEFAULT_GUARDRAILS: GuardrailsConfig = {
   allocatedCapitalInr: 0,
   maxDailyLossPct: 100.0,
-  maxTotalDrawdownPct: 100.0,
-  riskPerTradePct: 8.0,
-  maxOpenPositions: 1,
-  maxSingleStockWeightPct: 95,
-  maxSectorPositions: 1,
+  maxTotalDrawdownPct: 25.0,
+  riskPerTradePct: 15.0,
+  maxOpenPositions: 3,
+  maxSingleStockWeightPct: 60,
+  maxSectorPositions: 2,
   maxOrdersPerMinute: 6,
   consecutiveLossCooldownCount: 3,
   cooldownMinutes: 30,
@@ -88,12 +89,12 @@ const DEFAULT_STRATEGIES: StrategyConfig[] = [
     id: 'ORB_VWAP',
     name: 'ORB + VWAP Momentum',
     description:
-      'Intraday opening range breakout confirmed by VWAP slope & relative volume > 1.3x.',
+      'Institutional VWAP + EMA trend continuation confirmed by relative volume >= 1.05x.',
     enabled: true,
     capitalWeightPct: 40,
     minConfidence: 62,
     stopLossAtrMult: 1.15,
-    targetAtrMult: 2.1,
+    targetAtrMult: 2.2,
     tradesCount: 0,
     winCount: 0,
     netPnlInr: 0,
@@ -102,12 +103,12 @@ const DEFAULT_STRATEGIES: StrategyConfig[] = [
     id: 'MEAN_REVERSION',
     name: 'Bollinger Z-Score Reversion',
     description:
-      'Fades extreme intraday Z-score (±1.6σ) & RSI exhaustion with tight ATR stops.',
+      'Fades intraday oversold Z-score (-1.25σ) & RSI exhaustion snapping off intraday low.',
     enabled: true,
     capitalWeightPct: 30,
     minConfidence: 60,
     stopLossAtrMult: 1.0,
-    targetAtrMult: 1.65,
+    targetAtrMult: 1.85,
     tradesCount: 0,
     winCount: 0,
     netPnlInr: 0,
@@ -116,12 +117,12 @@ const DEFAULT_STRATEGIES: StrategyConfig[] = [
     id: 'PAIRS_SPREAD',
     name: 'Sector Pairs Spread',
     description:
-      'Market-neutral relative-value spread across correlated sector leaders (HDFC/ICICI, INFY/TCS).',
+      'Market-neutral relative-value catch-up across correlated sector leaders (HDFC/ICICI, INFY/TCS).',
     enabled: true,
     capitalWeightPct: 30,
-    minConfidence: 64,
+    minConfidence: 63,
     stopLossAtrMult: 1.1,
-    targetAtrMult: 1.9,
+    targetAtrMult: 2.0,
     tradesCount: 0,
     winCount: 0,
     netPnlInr: 0,
@@ -159,10 +160,14 @@ interface PersistedState {
   aiAutoApply: boolean;
   lastSessionIstDate?: string | null;
   lastNotifierPromptAtMs?: number;
+  tokenApprovedAfterResetIstDate?: string | null;
+  tokenPromptsSentIstDate?: string | null;
+  tokenPromptSlotsSent?: string[];
 }
 
 const DATA_DIR = path.resolve(process.cwd(), 'data');
 const STATE_FILE = path.join(DATA_DIR, 'bot-state.json');
+const TRADE_HISTORY_FILE = path.join(DATA_DIR, 'trade-history.jsonl');
 
 export class TradingEngine {
   private state: PersistedState;
@@ -174,6 +179,7 @@ export class TradingEngine {
   private recentOrderTimestamps: number[] = [];
   private timer: NodeJS.Timeout | null = null;
   private isStepping = false;
+  private lastStepStartedAtMs = 0;
   private lastAiRunMs = 0;
   private lastNotifierPromptMs = 0;
   private staticIp: StaticIpInfo = {
@@ -310,20 +316,53 @@ export class TradingEngine {
               lastQuoteAt: null,
             };
           });
-          // Apply updated ₹0 survival floor & remove legacy hardcoded ₹10,000 placeholder before live sync
+          // Apply user-calibrated multi-slot & 25% survival defaults on fresh/zero-trade deployments
           if (parsed.trades.length === 0 && parsed.positions.length === 0) {
-            if (parsed.guardrails.maxTotalDrawdownPct === 50) {
-              parsed.guardrails.maxTotalDrawdownPct = 100;
+            if (
+              parsed.guardrails.maxTotalDrawdownPct === 50 ||
+              parsed.guardrails.maxTotalDrawdownPct === 100
+            ) {
+              parsed.guardrails.maxTotalDrawdownPct = 25.0;
             }
-            if (parsed.guardrails.maxDailyLossPct === 25) {
-              parsed.guardrails.maxDailyLossPct = 100;
+            if (
+              parsed.guardrails.maxDailyLossPct === 25 ||
+              parsed.guardrails.maxDailyLossPct === 6
+            ) {
+              parsed.guardrails.maxDailyLossPct = 100.0;
             }
             if (parsed.guardrails.autoSquareoffIst === '15:15') {
               parsed.guardrails.autoSquareoffIst = '15:05';
             }
-            if (parsed.guardrails.riskPerTradePct === 5) {
-              parsed.guardrails.riskPerTradePct = 8;
+            if (
+              parsed.guardrails.riskPerTradePct === 5 ||
+              parsed.guardrails.riskPerTradePct === 8 ||
+              parsed.guardrails.riskPerTradePct === 3.5
+            ) {
+              parsed.guardrails.riskPerTradePct = 15.0;
             }
+            if (parsed.guardrails.maxOpenPositions === 1) {
+              parsed.guardrails.maxOpenPositions = 3;
+            }
+            if (parsed.guardrails.maxSectorPositions === 1) {
+              parsed.guardrails.maxSectorPositions = 2;
+            }
+            if (
+              parsed.guardrails.maxSingleStockWeightPct === 95 ||
+              parsed.guardrails.maxSingleStockWeightPct === 100
+            ) {
+              parsed.guardrails.maxSingleStockWeightPct = 60;
+            }
+            parsed.strategies = parsed.strategies.map((s) => {
+              if (s.tradesCount > 0) return s;
+              const def = DEFAULT_STRATEGIES.find((d) => d.id === s.id);
+              return def
+                ? {
+                    ...s,
+                    minConfidence: def.minConfidence,
+                    targetAtrMult: def.targetAtrMult,
+                  }
+                : s;
+            });
             if (parsed.upstoxLiveBalanceInr === null) {
               parsed.guardrails.allocatedCapitalInr = 0;
               parsed.initialCapitalInr = 0;
@@ -399,6 +438,46 @@ export class TradingEngine {
     return Math.min(1, Math.max(0.08, elapsed / 375));
   }
 
+  private getIstClock(): {
+    istDateStr: string;
+    hour: number;
+    minute: number;
+    totalMins: number;
+  } {
+    const now = new Date();
+    const parts = new Intl.DateTimeFormat('en-GB', {
+      timeZone: 'Asia/Kolkata',
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+      hour12: false,
+    }).formatToParts(now);
+    const map: Record<string, string> = {};
+    for (const p of parts) map[p.type] = p.value;
+    const hour = Number(map.hour || '0');
+    const minute = Number(map.minute || '0');
+    return {
+      istDateStr: `${map.year}-${map.month}-${map.day}`,
+      hour,
+      minute,
+      totalMins: hour * 60 + minute,
+    };
+  }
+
+  public markTokenApprovedToday(): void {
+    const clock = this.getIstClock();
+    this.state.upstoxAccountError = null;
+    // Upstox invalidates yesterday's token at 03:30 IST. Any approval after 03:30 IST locks prompts for the rest of today.
+    if (clock.totalMins >= 3 * 60 + 30) {
+      this.state.tokenApprovedAfterResetIstDate = clock.istDateStr;
+    }
+    this.state.tokenPromptsSentIstDate = clock.istDateStr;
+    this.state.tokenPromptSlotsSent = ['APPROVED'];
+    this.persistState();
+  }
+
   private async warmUpUniverseIfNeeded(istDateStr: string): Promise<void> {
     if (this.warmedUpIstDate === istDateStr || this.isWarmingUp || !getUpstoxAccessToken()) {
       return;
@@ -409,6 +488,7 @@ export class TradingEngine {
       const fromDt = new Date(Date.now() - 25 * 24 * 60 * 60 * 1000);
       const fromDate = fromDt.toISOString().slice(0, 10);
 
+      let warmedCount = 0;
       for (const meta of NSE_UNIVERSE) {
         const daily = await fetchUpstoxHistoricalCandles(meta.symbol, 'days', 1, fromDate, toDate);
         if (daily.ok && daily.candles.length > 0) {
@@ -432,6 +512,7 @@ export class TradingEngine {
           if (closes.length > 0) {
             this.priceHistories.set(meta.symbol, closes);
             this.lastBarPushMs.set(meta.symbol, Date.now());
+            warmedCount += 1;
           }
         } else if (daily.ok && daily.candles.length > 0 && !this.priceHistories.has(meta.symbol)) {
           const dailyCloses = daily.candles
@@ -441,15 +522,75 @@ export class TradingEngine {
             .filter((c) => c > 0);
           if (dailyCloses.length > 0) {
             this.priceHistories.set(meta.symbol, dailyCloses);
+            warmedCount += 1;
           }
         }
       }
-      this.warmedUpIstDate = istDateStr;
+      if (warmedCount >= 6) {
+        this.warmedUpIstDate = istDateStr;
+      }
     } catch {
       // Transient warmup errors will be retried on next session check
     } finally {
       this.isWarmingUp = false;
     }
+  }
+
+  private maybeSendScheduledTokenPrompt(): void {
+    const redirectHint = `${process.env.APP_URL || ''} ${process.env.UPSTOX_REDIRECT_URI || ''}`;
+    const behindAiStudioProxy = redirectHint.includes('ais-dev-');
+    const allowAutoWhatsApp =
+      process.env.UPSTOX_PUBLIC_WEBHOOK === 'true' || !behindAiStudioProxy;
+
+    if (!allowAutoWhatsApp || !process.env.UPSTOX_API_KEY || !process.env.UPSTOX_API_SECRET) {
+      return;
+    }
+
+    const clock = this.getIstClock();
+    // Already approved after today's 03:30 IST reset -> zero repeat messages!
+    if (this.state.tokenApprovedAfterResetIstDate === clock.istDateStr) {
+      return;
+    }
+
+    if (this.state.tokenPromptsSentIstDate !== clock.istDateStr) {
+      this.state.tokenPromptsSentIstDate = clock.istDateStr;
+      this.state.tokenPromptSlotsSent = [];
+    }
+    const sentSlots = this.state.tokenPromptSlotsSent ?? [];
+    if (sentSlots.includes('APPROVED')) {
+      return;
+    }
+
+    // Wait quietly after 03:30 AM reset until 04:00 AM IST; send 1 prompt at 04:00, optional 1 nudge at 05:00 if unapproved, and 1 pre-market fallback at >=08:45 ONLY if still unapproved.
+    let slot: string | null = null;
+    if (clock.totalMins >= 240 && clock.totalMins < 300) {
+      slot = '0400';
+    } else if (clock.totalMins >= 300 && clock.totalMins < 525) {
+      slot = '0500';
+    } else if (clock.totalMins >= 525 && clock.totalMins <= 930) {
+      slot = '0845';
+    }
+
+    if (!slot || sentSlots.includes(slot)) {
+      return;
+    }
+
+    this.state.tokenPromptSlotsSent = [...sentSlots, slot];
+    this.lastNotifierPromptMs = Date.now();
+    this.state.lastNotifierPromptAtMs = this.lastNotifierPromptMs;
+    this.persistState();
+
+    const label =
+      slot === '0400'
+        ? '04:00 AM IST Daily Approval'
+        : slot === '0500'
+          ? '05:00 AM IST Reminder (Still Unapproved)'
+          : 'Pre-Market Token Approval Needed';
+
+    void requestUpstoxAccessTokenViaNotifier();
+    void sendTelegramAlert(
+      `${label}: Upstox 24h token reset at 03:30 AM. Tap Approve on your Upstox WhatsApp/App notification once—zero repeat alerts after approval.`
+    );
   }
 
   private handleExpiredUpstoxToken(errMsg: string): void {
@@ -462,25 +603,11 @@ export class TradingEngine {
     if (this.state.status !== 'DEADMAN_LOCK' && this.state.status !== 'HALTED_DAILY_LOSS') {
       this.state.status = 'AWAITING_UPSTOX_TOKEN';
       this.state.statusReason = allowAutoWhatsApp
-        ? 'Upstox 24h token expired; tap Approve on your Upstox WhatsApp/App notification or click 1-Tap Upstox Login.'
+        ? 'Upstox 24h token expired; scheduled 04:00–05:00 IST WhatsApp/Upstox prompt arms automatically (or send /prompt).'
         : 'Upstox 24h token expired; click 1-Tap Upstox Login (opens Upstox login in a new tab to connect instantly).';
     }
 
-    // Self-healing: on a public HTTPS webhook server, send at most 1 WhatsApp approval prompt per 12h (persisted on disk)
-    const nowMs = Date.now();
-    if (
-      allowAutoWhatsApp &&
-      process.env.UPSTOX_API_KEY &&
-      process.env.UPSTOX_API_SECRET &&
-      nowMs - this.lastNotifierPromptMs >= 12 * 60 * 60_000
-    ) {
-      this.lastNotifierPromptMs = nowMs;
-      this.state.lastNotifierPromptAtMs = nowMs;
-      void requestUpstoxAccessTokenViaNotifier();
-      void sendTelegramAlert(
-        'Upstox 24h token expired. WhatsApp/Upstox approval prompt sent—tap Approve on your phone to auto-resume.'
-      );
-    }
+    this.maybeSendScheduledTokenPrompt();
     this.persistState();
   }
 
@@ -570,9 +697,15 @@ export class TradingEngine {
       return { ok: false, updatedCount: 0, error: quoteRes.error };
     }
 
-    // Quotes succeeded -> Upstox token & live market feed are confirmed active
-    if (quoteRes.quotes.length > 0 && (funds.ok || fundsMaintenance)) {
-      this.state.upstoxAccountError = null;
+    // Quotes succeeded -> Upstox token & live market feed are confirmed active (clear any transient network error)
+    if (quoteRes.quotes.length > 0) {
+      if (funds.ok || fundsMaintenance || this.state.upstoxLiveBalanceInr !== null) {
+        this.state.upstoxAccountError = null;
+      }
+      const clock = this.getIstClock();
+      if (clock.totalMins >= 3 * 60 + 30) {
+        this.state.tokenApprovedAfterResetIstDate = clock.istDateStr;
+      }
     }
 
     for (const q of quoteRes.quotes) {
@@ -744,6 +877,7 @@ export class TradingEngine {
       aiSupervisor: this.state.aiSupervisor,
       aiThrottleMultiplier: this.state.aiThrottleMultiplier,
       staticIp: this.staticIp,
+      newsDigest: getCachedMarketNewsDigest(),
     };
   }
 
@@ -1142,25 +1276,25 @@ export class TradingEngine {
 
     // STRICT LONG-ONLY (BUY entries only; never short sell)
     if (
-      t.rvol >= 1.15 &&
+      t.rvol >= 1.05 &&
       t.ltp > t.vwap &&
-      t.ltp > (t.open > 0 ? t.open : t.prevClose) &&
-      t.ema9 > t.ema21 &&
-      t.rsi14 > 54 &&
-      t.rsi14 < 73
+      t.ltp >= (t.open > 0 ? t.open * 0.999 : t.prevClose) &&
+      t.ema9 >= t.ema21 &&
+      t.rsi14 >= 51 &&
+      t.rsi14 <= 74
     ) {
       signal = 'ORB_VWAP';
       signalSide = 'BUY';
-      signalConfidence = Math.min(92, Math.round(60 + (t.rvol - 1.1) * 28));
+      signalConfidence = Math.min(94, Math.round(62 + Math.max(0, t.rvol - 1.0) * 30));
     } else if (
-      t.zScore <= -1.55 &&
-      t.rsi14 <= 38 &&
-      (t.prevClose <= 0 || t.ltp >= t.prevClose * 0.965) &&
+      (t.zScore <= -1.25 || (t.ltp < t.vwap * 0.992 && t.rsi14 <= 44)) &&
+      t.rsi14 <= 46 &&
+      (t.prevClose <= 0 || t.ltp >= t.prevClose * 0.96) &&
       (t.low <= 0 || t.ltp >= t.low * 1.001)
     ) {
       signal = 'MEAN_REVERSION';
       signalSide = 'BUY';
-      signalConfidence = Math.min(90, Math.round(56 + Math.abs(t.zScore) * 14));
+      signalConfidence = Math.min(92, Math.round(58 + Math.max(0.5, Math.abs(t.zScore)) * 15));
     } else {
       const pairMap: Record<string, string> = {
         HDFCBANK: 'ICICIBANK',
@@ -1173,14 +1307,26 @@ export class TradingEngine {
       const peerSym = pairMap[t.symbol];
       if (peerSym) {
         const peer = this.state.tickers.find((p) => p.symbol === peerSym);
-        if (peer && peer.ltp > 0 && peer.changePct > -0.5 && t.rsi14 < 58) {
+        if (peer && peer.ltp > 0 && peer.changePct > -0.4 && t.rsi14 < 62) {
           const spreadPct = t.changePct - peer.changePct;
-          if (spreadPct <= -0.5) {
+          if (spreadPct <= -0.35) {
             signal = 'PAIRS_SPREAD';
             signalSide = 'BUY';
-            signalConfidence = Math.min(88, Math.round(58 + Math.abs(spreadPct) * 24));
+            signalConfidence = Math.min(90, Math.round(60 + Math.abs(spreadPct) * 24));
           }
         }
+      }
+    }
+
+    if (signal && signalConfidence > 0) {
+      const news = getCachedMarketNewsDigest();
+      const symNews = news.symbolBias[t.symbol];
+      if (symNews) {
+        signalConfidence = Math.max(25, Math.min(96, signalConfidence + symNews.score * 2));
+      } else if (news.macroScore >= 2) {
+        signalConfidence = Math.min(96, signalConfidence + 2);
+      } else if (news.macroScore <= -3) {
+        signalConfidence = Math.max(30, signalConfidence - 3);
       }
     }
 
@@ -1199,8 +1345,15 @@ export class TradingEngine {
         (optionLtp - pos.entryPrice) * pos.qty - pos.entryChargesInr
       );
       let trailingStop = pos.trailingStop;
-      if (unrealizedPnlInr >= pos.riskAmountInr * 0.75) {
-        const feeBufferPerUnit = (pos.entryChargesInr * 2.1) / Math.max(1, pos.qty);
+      const feeBufferPerUnit = (pos.entryChargesInr * 2.2) / Math.max(1, pos.qty);
+      if (unrealizedPnlInr >= pos.riskAmountInr * 1.25 && optionLtp > pos.entryPrice) {
+        const lockHalfGain = pos.entryPrice + (optionLtp - pos.entryPrice) * 0.5;
+        const trailCandidate = round2(
+          Math.max(pos.entryPrice + feeBufferPerUnit, lockHalfGain, optionLtp * 0.9)
+        );
+        trailingStop =
+          trailingStop === null ? trailCandidate : Math.max(trailingStop, trailCandidate);
+      } else if (unrealizedPnlInr >= pos.riskAmountInr * 0.6) {
         const trailCandidate = round2(
           Math.max(pos.entryPrice + feeBufferPerUnit, optionLtp * 0.88)
         );
@@ -1230,8 +1383,15 @@ export class TradingEngine {
       const unrealizedPnlInr = round2(diff * pos.qty - pos.entryChargesInr);
 
       let trailingStop = pos.trailingStop;
-      if (unrealizedPnlInr >= pos.riskAmountInr * 0.75) {
-        const feeBufferPerUnit = (pos.entryChargesInr * 2.1) / Math.max(1, pos.qty);
+      const feeBufferPerUnit = (pos.entryChargesInr * 2.2) / Math.max(1, pos.qty);
+      if (unrealizedPnlInr >= pos.riskAmountInr * 1.25 && pos.side === 'BUY' && ticker.ltp > pos.entryPrice) {
+        const lockHalfGain = pos.entryPrice + (ticker.ltp - pos.entryPrice) * 0.55;
+        const trailCandidate = round2(
+          Math.max(pos.entryPrice + feeBufferPerUnit, lockHalfGain, ticker.ltp - ticker.atr14 * 0.55)
+        );
+        trailingStop =
+          trailingStop === null ? trailCandidate : Math.max(trailingStop, trailCandidate);
+      } else if (unrealizedPnlInr >= pos.riskAmountInr * 0.6) {
         const trailCandidate =
           pos.side === 'BUY'
             ? round2(
@@ -1382,7 +1542,7 @@ export class TradingEngine {
     this.state.dailyPnlInr = round2(this.state.dailyPnlInr + netPnlInr);
     this.state.totalChargesPaidInr = round2(this.state.totalChargesPaidInr + totalCharges);
 
-    this.state.trades.unshift({
+    const recTrade: TradeRecord = {
       id: `TRD-REC-${Date.now()}`,
       symbol: pos.symbol,
       instrumentType: instType,
@@ -1399,7 +1559,108 @@ export class TradingEngine {
       exitReason,
       openedAt: pos.openedAt,
       closedAt: new Date().toISOString(),
-    });
+    };
+    this.state.trades.unshift(recTrade);
+    this.appendTradeHistoryLog(recTrade);
+    this.adaptStrategyFromClosedTrade(pos.strategyId);
+  }
+
+  private appendTradeHistoryLog(trade: TradeRecord): void {
+    try {
+      if (!fs.existsSync(DATA_DIR)) {
+        fs.mkdirSync(DATA_DIR, { recursive: true });
+      }
+      fs.appendFileSync(TRADE_HISTORY_FILE, `${JSON.stringify(trade)}\n`, 'utf-8');
+    } catch {
+      // Non-fatal disk append
+    }
+  }
+
+  public getTradeHistory(limit = 300): TradeRecord[] {
+    const merged = new Map<string, TradeRecord>();
+    try {
+      if (fs.existsSync(TRADE_HISTORY_FILE)) {
+        const lines = fs.readFileSync(TRADE_HISTORY_FILE, 'utf-8').split('\n');
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (!trimmed) continue;
+          try {
+            const parsed = JSON.parse(trimmed) as TradeRecord;
+            if (parsed?.id) merged.set(parsed.id, parsed);
+          } catch {
+            // Skip malformed line
+          }
+        }
+      }
+    } catch {
+      // Fallback to in-memory state
+    }
+    for (const tr of this.state.trades) {
+      merged.set(tr.id, tr);
+    }
+    return Array.from(merged.values())
+      .sort((a, b) => new Date(b.closedAt).getTime() - new Date(a.closedAt).getTime())
+      .slice(0, limit);
+  }
+
+  private getTodayTradedSymbols(): string[] {
+    const todayIst = this.getIstClock().istDateStr;
+    const set = new Set<string>();
+    for (const p of this.state.positions) {
+      set.add(p.symbol);
+    }
+    for (const tr of this.state.trades) {
+      const trIst = new Intl.DateTimeFormat('en-CA', {
+        timeZone: 'Asia/Kolkata',
+        year: 'numeric',
+        month: '2-digit',
+        day: '2-digit',
+      }).format(new Date(tr.closedAt));
+      if (trIst === todayIst) {
+        set.add(tr.symbol);
+      }
+    }
+    return Array.from(set);
+  }
+
+  private adaptStrategyFromClosedTrade(strategyId: StrategyId): void {
+    const strat = this.state.strategies.find((s) => s.id === strategyId);
+    if (!strat || strat.tradesCount < 3) return;
+
+    const recentForStrat = this.state.trades
+      .filter((t) => t.strategyId === strategyId)
+      .slice(0, 5);
+    const recentNet = recentForStrat.reduce((acc, t) => acc + t.netPnlInr, 0);
+    const winRate = strat.winCount / Math.max(1, strat.tradesCount);
+
+    let nextConf = strat.minConfidence;
+    let nextWeight = strat.capitalWeightPct;
+
+    if (recentNet < 0 && winRate < 0.42) {
+      nextConf = Math.min(82, strat.minConfidence + 2);
+      nextWeight = Math.max(15, strat.capitalWeightPct - 4);
+    } else if (recentNet > 0 && winRate >= 0.55) {
+      nextConf = Math.max(54, strat.minConfidence - 1);
+      nextWeight = Math.min(65, strat.capitalWeightPct + 4);
+    }
+
+    if (nextConf !== strat.minConfidence || nextWeight !== strat.capitalWeightPct) {
+      this.state.strategies = this.state.strategies.map((s) =>
+        s.id === strategyId
+          ? { ...s, minConfidence: nextConf, capitalWeightPct: nextWeight }
+          : s
+      );
+      this.addRiskAudit({
+        symbol: strategyId,
+        side: 'BUY',
+        requestedQty: 0,
+        approvedQty: 0,
+        strategyId,
+        decision: 'APPROVED',
+        rule: 'SELF_LEARNING_TUNE',
+        reason: `Self-learning updated ${strategyId}: minConf ${strat.minConfidence}->${nextConf}, weight ${strat.capitalWeightPct}%->${nextWeight}% (${strat.winCount}/${strat.tradesCount} wins).`,
+      });
+    }
   }
 
   private async closePosition(
@@ -1487,7 +1748,7 @@ export class TradingEngine {
         : s
     );
 
-    this.state.trades.unshift({
+    const closedTrade: TradeRecord = {
       id: `TRD-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
       symbol: pos.symbol,
       instrumentType: instType,
@@ -1504,8 +1765,11 @@ export class TradingEngine {
       exitReason,
       openedAt: pos.openedAt,
       closedAt: new Date().toISOString(),
-    });
+    };
+    this.state.trades.unshift(closedTrade);
+    this.appendTradeHistoryLog(closedTrade);
     if (this.state.trades.length > 100) this.state.trades.pop();
+    this.adaptStrategyFromClosedTrade(pos.strategyId);
     this.recentOrderTimestamps.push(Date.now());
     void sendTelegramAlert(
       `TRADE CLOSED: ${pos.symbol} (${exitReason})\nQty: ${pos.qty} | Entry ₹${pos.entryPrice.toFixed(2)} -> Exit ₹${exitPrice.toFixed(2)}\nNet PnL: ${netPnlInr >= 0 ? '+' : ''}₹${netPnlInr.toFixed(2)} (Upstox Fees: ₹${totalCharges.toFixed(2)})`
@@ -1587,6 +1851,7 @@ export class TradingEngine {
         `Peak Equity: ₹${snap.peakEquityInr.toLocaleString('en-IN')} | Floor: ₹${snap.survivalFloorInr}`,
         `Daily Net PnL: ${snap.dailyPnlInr >= 0 ? '+' : ''}₹${snap.dailyPnlInr.toFixed(2)} (Fees ₹${snap.totalChargesPaidInr.toFixed(2)})`,
         `NIFTY 50: ${snap.session.nifty50 || '-'} | India VIX: ${snap.session.indiaVix.toFixed(1)} | ${snap.session.phase}`,
+        `News Macro: ${snap.newsDigest?.macroSentiment || 'NEUTRAL'} (${snap.newsDigest?.headlines.length ?? 0} headlines)`,
         `Open Slot (${snap.positions.length}/${snap.guardrails.maxOpenPositions}): ${posLine}`,
         `AWS Server: ${health.rssMb} MB RSS | CPU ${health.cpuLoadPct}%`,
       ].join('\n');
@@ -1639,6 +1904,7 @@ export class TradingEngine {
       if (!ex.ok) {
         return `Upstox code exchange failed: ${ex.error}`;
       }
+      this.markTokenApprovedToday();
       await this.syncUpstoxAccountAndQuotes();
       this.resumeAutonomous();
       const after = this.getSnapshot();
@@ -1655,6 +1921,7 @@ export class TradingEngine {
         return 'Usage: /token <upstox_access_token>';
       }
       saveUpstoxAccessToken(cleanToken);
+      this.markTokenApprovedToday();
       const sync = await this.syncUpstoxAccountAndQuotes();
       if (!sync.ok) {
         return `Token saved, verify warning: ${sync.error}`;
@@ -1693,8 +1960,14 @@ export class TradingEngine {
   }
 
   public async autonomousTick(): Promise<void> {
-    if (this.isStepping) return;
+    if (this.isStepping) {
+      if (Date.now() - this.lastStepStartedAtMs < 25_000) {
+        return;
+      }
+      console.warn('[ArthaQuant Self-Heal] Resetting stalled tick watchdog (>25s).');
+    }
     this.isStepping = true;
+    this.lastStepStartedAtMs = Date.now();
 
     try {
       this.state.tickCount += 1;
@@ -1732,6 +2005,9 @@ export class TradingEngine {
       if (this.state.tickCount % 3 === 1) {
         void pollTelegramCommands((cmd, argsText) => this.handleTelegramCommand(cmd, argsText));
       }
+      if (this.state.tickCount % 20 === 1) {
+        void refreshMarketNewsDigest();
+      }
 
       if (
         this.state.status === 'DEADMAN_LOCK' ||
@@ -1745,11 +2021,16 @@ export class TradingEngine {
         const prevStatus = this.state.status;
         this.state.status = 'AWAITING_UPSTOX_TOKEN';
         this.state.statusReason =
-          'Waiting for daily Upstox token. Approve WhatsApp prompt or use 1-Tap Login / mobile /code.';
+          'Waiting for daily Upstox token. Scheduled 04:00–05:00 IST WhatsApp approval active (zero repeat spam after approval).';
+        this.maybeSendScheduledTokenPrompt();
         if (prevStatus !== this.state.status || this.state.tickCount % 20 === 0) {
           this.persistState();
         }
         return;
+      }
+
+      if (this.state.status === 'AWAITING_UPSTOX_TOKEN') {
+        this.maybeSendScheduledTokenPrompt();
       }
 
       // If market is closed (weekend, holiday, pre-open, post-close): sync every 15s so UPI deposits reflect quickly
@@ -1869,19 +2150,20 @@ export class TradingEngine {
     const nowMins = hh * 60 + mm;
     const [sqH, sqM] = this.state.guardrails.autoSquareoffIst.split(':').map(Number);
     const sqMins = (Number.isFinite(sqH) ? sqH : 15) * 60 + (Number.isFinite(sqM) ? sqM : 5);
-    if (canExecuteOrders && nowMins >= sqMins - 10) {
+    // Avoid first 5 minutes opening-bell volatility spikes (09:15–09:19 IST) and final 10 minutes before squareoff
+    if (canExecuteOrders && (nowMins < 9 * 60 + 20 || nowMins >= sqMins - 10)) {
       return;
     }
 
     const eq = this.computeEquityMetrics();
     const aiScalar = this.state.aiAutoApply ? this.state.aiThrottleMultiplier : 1.0;
+    const niftyChg =
+      this.state.niftyBase > 0
+        ? ((this.state.nifty50 - this.state.niftyBase) / this.state.niftyBase) * 100
+        : 0;
 
     // 1. Check NIFTY 50 Index Option Buying (BUY CE when bullish, BUY PE when bearish — NEVER Option Writing)
     if (this.state.guardrails.allowIndexOptions !== false) {
-      const niftyChg =
-        this.state.niftyBase > 0
-          ? ((this.state.nifty50 - this.state.niftyBase) / this.state.niftyBase) * 100
-          : 0;
       const bearishBreadth = this.state.tickers.filter(
         (t) => t.ltp > 0 && t.ltp < t.vwap && t.ema9 < t.ema21
       ).length;
@@ -1890,7 +2172,7 @@ export class TradingEngine {
       ).length;
 
       let optionBias: 'CE' | 'PE' | null = null;
-      if (niftyChg <= -0.35 || bearishBreadth >= 5) {
+      if (niftyChg <= -0.45 && bearishBreadth >= 5) {
         optionBias = 'PE';
       } else if (niftyChg >= 0.45 && bullishBreadth >= 5) {
         optionBias = 'CE';
@@ -1901,11 +2183,29 @@ export class TradingEngine {
         const optRes = await fetchAffordableNiftyOption(optionBias, maxBudget);
         if (optRes.ok && optRes.option) {
           const opt = optRes.option;
-          const stopDistance = round2(Math.max(opt.ltp * 0.22, 6));
-          const targetDistance = round2(stopDistance * 1.85);
+          const stopDistance = round2(Math.max(opt.ltp * 0.18, 5));
+          const targetDistance = round2(stopDistance * 2.0);
           const stopLoss = round2(Math.max(1, opt.ltp - stopDistance));
           const takeProfit = round2(opt.ltp + targetDistance);
           const instType: InstrumentType = optionBias === 'CE' ? 'OPTION_CE' : 'OPTION_PE';
+          const optConfidence = Math.min(
+            94,
+            Math.round(
+              76 +
+                (Math.abs(niftyChg) >= 0.65 ? 8 : 0) +
+                (optionBias === 'CE' && bullishBreadth >= 7 ? 6 : 0) +
+                (optionBias === 'PE' && bearishBreadth >= 7 ? 6 : 0)
+            )
+          );
+          const optConvictionBudget =
+            eq.availableMargin *
+            (optConfidence >= 82 ? 1.0 : Math.min(0.9, 0.45 + (optConfidence - 65) * 0.02)) *
+            aiScalar;
+          const requestedLots = Math.max(
+            1,
+            Math.floor(optConvictionBudget / Math.max(1, opt.ltp * opt.lotSize))
+          );
+          const optRequestedQty = requestedLots * opt.lotSize;
 
           const optTicker: MarketTickerSnapshot = {
             symbol: opt.tradingSymbol,
@@ -1927,7 +2227,7 @@ export class TradingEngine {
             ema21: opt.ltp,
             signal: 'ORB_VWAP',
             signalSide: 'BUY',
-            signalConfidence: 76,
+            signalConfidence: optConfidence,
             lastQuoteAt: new Date().toISOString(),
           };
 
@@ -1938,7 +2238,7 @@ export class TradingEngine {
             instrumentType: instType,
             lotSize: opt.lotSize,
             side: 'BUY',
-            requestedQty: opt.lotSize,
+            requestedQty: optRequestedQty,
             stopLossPrice: stopLoss,
             takeProfitPrice: takeProfit,
             strategyId: 'ORB_VWAP',
@@ -1950,12 +2250,14 @@ export class TradingEngine {
             recentOrderTimestamps: this.recentOrderTimestamps,
             indiaVix,
             canExecuteOrders,
+            signalConfidence: optConfidence,
+            tradedTodaySymbols: this.getTodayTradedSymbols(),
           });
 
           this.addRiskAudit({
             symbol: opt.tradingSymbol,
             side: 'BUY',
-            requestedQty: opt.lotSize,
+            requestedQty: optRequestedQty,
             approvedQty: riskResult.approvedQty,
             strategyId: 'ORB_VWAP',
             decision: riskResult.decision,
@@ -2008,16 +2310,38 @@ export class TradingEngine {
       }
     }
 
-    // 2. Otherwise evaluate Long-Only Equity BUY signals
+    // 2. Otherwise evaluate Long-Only Equity BUY signals across up to maxOpenPositions slots (never duplicate same symbol same day)
     const candidates = this.state.tickers
       .filter((t) => t.ltp > 0 && t.signal !== null && t.signalSide === 'BUY')
       .sort((a, b) => b.signalConfidence - a.signalConfidence);
 
     if (candidates.length === 0) return;
 
-    for (const top of candidates.slice(0, 3)) {
+    for (const top of candidates.slice(0, 6)) {
+      if (this.state.positions.length >= this.state.guardrails.maxOpenPositions) {
+        break;
+      }
+      const liveEq = this.computeEquityMetrics();
+      if (liveEq.availableMargin < top.ltp) {
+        continue;
+      }
+
       const strat = this.state.strategies.find((s) => s.id === top.signal);
       if (!strat || !strat.enabled || top.signalConfidence < strat.minConfidence) {
+        continue;
+      }
+
+      if (niftyChg <= -0.85 && strat.id !== 'MEAN_REVERSION') {
+        this.addRiskAudit({
+          symbol: top.symbol,
+          side: 'BUY',
+          requestedQty: 0,
+          approvedQty: 0,
+          strategyId: strat.id,
+          decision: 'THROTTLED',
+          rule: 'NIFTY_SELLOFF_GUARD',
+          reason: `Blocked LONG ${top.symbol} (${strat.id}) because NIFTY 50 is down ${niftyChg.toFixed(2)}%.`,
+        });
         continue;
       }
 
@@ -2039,6 +2363,21 @@ export class TradingEngine {
         continue;
       }
 
+      const symNews = getCachedMarketNewsDigest().symbolBias[top.symbol];
+      if (symNews && symNews.score <= -2) {
+        this.addRiskAudit({
+          symbol: top.symbol,
+          side: 'BUY',
+          requestedQty: 0,
+          approvedQty: 0,
+          strategyId: strat.id,
+          decision: 'THROTTLED',
+          rule: 'NEWS_BEARISH_VETO',
+          reason: `Bearish headline vetoed LONG ${top.symbol}: "${symNews.headline}"`,
+        });
+        continue;
+      }
+
       const side: OrderSide = 'BUY';
       const stopDistance = Math.max(top.atr14 * strat.stopLossAtrMult, top.ltp * 0.005);
       const targetDistance = Math.max(top.atr14 * strat.targetAtrMult, stopDistance * 1.8);
@@ -2046,12 +2385,21 @@ export class TradingEngine {
       const stopLoss = round2(top.ltp - stopDistance);
       const takeProfit = round2(top.ltp + targetDistance);
 
-      const rawTargetRiskInr =
-        eq.currentEquity *
-        (this.state.guardrails.riskPerTradePct / 100) *
-        (strat.capitalWeightPct / 35) *
-        aiScalar;
-      const requestedQty = Math.max(1, Math.floor(rawTargetRiskInr / stopDistance));
+      const pctRiskInr = liveEq.currentEquity * (this.state.guardrails.riskPerTradePct / 100);
+      const clampedRiskInr =
+        liveEq.currentEquity >= 4000
+          ? Math.min(2000, Math.max(1000, pctRiskInr))
+          : Math.max(250, pctRiskInr);
+      const rawTargetRiskInr = clampedRiskInr * (strat.capitalWeightPct / 35) * aiScalar;
+      const riskBasedQty = Math.max(1, Math.floor(rawTargetRiskInr / stopDistance));
+
+      // Conviction scaling (1.0x zero-margin cash only): high-confidence signals deploy up to maxSingleStockWeightPct of available cash
+      let requestedQty = riskBasedQty;
+      if (top.signalConfidence >= 80 && indiaVix < this.state.guardrails.vixThrottleThreshold) {
+        const cashShare = Math.min(1.0, 0.55 + ((top.signalConfidence - 80) / 15) * 0.45) * aiScalar;
+        const convictionQty = Math.floor((liveEq.availableMargin * cashShare) / top.ltp);
+        requestedQty = Math.max(riskBasedQty, convictionQty);
+      }
 
       const riskResult = evaluatePreTradeRisk({
         engineStatus: this.state.status,
@@ -2063,14 +2411,16 @@ export class TradingEngine {
         stopLossPrice: stopLoss,
         takeProfitPrice: takeProfit,
         strategyId: strat.id,
-        currentEquityInr: eq.currentEquity,
+        currentEquityInr: liveEq.currentEquity,
         peakEquityInr: this.state.peakEquityInr,
-        availableMarginInr: eq.availableMargin,
-        dailyPnlInr: this.state.dailyPnlInr + eq.unrealizedPnl,
+        availableMarginInr: liveEq.availableMargin,
+        dailyPnlInr: this.state.dailyPnlInr + liveEq.unrealizedPnl,
         openPositions: this.state.positions,
         recentOrderTimestamps: this.recentOrderTimestamps,
         indiaVix,
         canExecuteOrders,
+        signalConfidence: top.signalConfidence,
+        tradedTodaySymbols: this.getTodayTradedSymbols(),
       });
 
       this.addRiskAudit({
@@ -2136,7 +2486,6 @@ export class TradingEngine {
       void sendTelegramAlert(
         `BUY ORDER FILLED (${strat.id})\n${top.symbol} x ${fill.qty} @ ₹${fill.executedPrice.toFixed(2)}\nStop Loss: ₹${stopLoss.toFixed(1)} | Target: ₹${takeProfit.toFixed(1)}\nEntry Fees: ₹${fill.chargesInr.toFixed(2)}`
       );
-      break;
     }
   }
 }

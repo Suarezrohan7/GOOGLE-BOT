@@ -1,9 +1,18 @@
-# Optional Caddy reverse proxy for automatic free Let's Encrypt HTTPS on AWS Lightsail (3.110.6.180)
-# Replace bot.yourdomain.com with a real domain pointed to 3.110.6.180, then run:
-#   sudo apt install -y caddy && sudo cp Caddyfile.aws /etc/caddy/Caddyfile && sudo systemctl reload caddy
-# Then set Upstox Redirect URL -> https://bot.yourdomain.com/api/upstox/callback
-# and Upstox Notifier Webhook -> https://bot.yourdomain.com/api/upstox/notifier-webhook
+# Caddy reverse proxy for automatic free HTTPS on AWS Lightsail (3.110.6.180).
+# Exposes ONLY Upstox Notifier Webhook & OAuth Callback publicly; keeps dashboard local-only.
+# Setup automatically via: bash setup-whatsapp-https.sh [yourname.duckdns.org]
 
-bot.yourdomain.com {
-    reverse_proxy 127.0.0.1:3000
+3-110-6-180.sslip.io {
+    @upstox_public {
+        path /api/upstox/notifier-webhook /api/upstox/callback
+    }
+    handle @upstox_public {
+        reverse_proxy 127.0.0.1:3000
+    }
+    handle / {
+        respond "Artha Quant Upstox Webhook Gateway Active (Dashboard is Local-Only)" 200
+    }
+    handle {
+        respond "Forbidden (Dashboard is Local-Only)" 403
+    }
 }

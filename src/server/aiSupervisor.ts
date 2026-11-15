@@ -25,6 +25,7 @@ function runBuiltInQuantSupervisor(
   const vix = snapshot.session.indiaVix;
   const bufferPct = snapshot.survivalBufferPct;
   const consec = snapshot.consecutiveLosses;
+  const news = snapshot.newsDigest;
 
   let regime: AiSupervisorReport['regimeAssessment'] = 'SELECTIVE';
   let throttle = 1.0;
@@ -32,10 +33,15 @@ function runBuiltInQuantSupervisor(
   if (bufferPct < 8 || consec >= 3 || vix >= 22) {
     regime = 'STAND_DOWN';
     throttle = 0.25;
-  } else if (bufferPct < 15 || consec >= 2 || vix >= snapshot.guardrails.vixThrottleThreshold) {
+  } else if (
+    bufferPct < 15 ||
+    consec >= 2 ||
+    vix >= snapshot.guardrails.vixThrottleThreshold ||
+    (news && news.macroScore <= -5)
+  ) {
     regime = 'DEFENSIVE';
     throttle = 0.5;
-  } else if (vix < 16 && Math.abs(snapshot.session.niftyChangePct) >= 0.4) {
+  } else if (vix < 16 && (Math.abs(snapshot.session.niftyChangePct) >= 0.4 || (news?.macroScore ?? 0) >= 2)) {
     regime = 'RISK_ON';
     throttle = 1.0;
   } else {
@@ -48,21 +54,28 @@ function runBuiltInQuantSupervisor(
   const vetoedSymbols: string[] = [];
 
   for (const t of activeTickers) {
-    if (t.rsi14 > 73 || t.rvol < 1.1) {
+    const symNews = news?.symbolBias?.[t.symbol];
+    if (t.rsi14 > 73 || t.rvol < 1.1 || (symNews && symNews.score <= -2)) {
       vetoedSymbols.push(t.symbol);
     } else {
       approvedSymbols.push(t.symbol);
     }
   }
 
+  const newsBoost = news ? Math.max(-8, Math.min(8, news.macroScore * 2)) : 0;
   const conviction = Math.min(
-    95,
-    Math.max(30, Math.round(70 - consec * 10 + (vix < 16 ? 12 : -8)))
+    96,
+    Math.max(30, Math.round(70 - consec * 10 + (vix < 16 ? 12 : -8) + newsBoost))
   );
+
+  const newsSummary =
+    news && news.headlines.length > 0
+      ? `News: ${news.macroSentiment} (${news.headlines.length} ET/Livemint headlines)`
+      : 'News: awaiting RSS sync';
 
   return {
     timestamp: new Date().toISOString(),
-    model: 'artha-quant-deterministic-v1',
+    model: 'artha-quant-deterministic-v2',
     regimeAssessment: regime,
     recommendedThrottle: throttle,
     convictionScore: conviction,
@@ -72,9 +85,9 @@ function runBuiltInQuantSupervisor(
       `PERMANENT CAPITAL SURVIVAL RULE: Live Equity ₹${snapshot.currentEquityInr.toFixed(0)}, Survival Floor ₹${snapshot.survivalFloorInr.toFixed(0)}. If depleted to floor (DEADMAN_LOCK), the bot stops permanently with zero restart.`,
       regime === 'STAND_DOWN'
         ? 'Volatility / drawdown throttle active at 0.25x to protect remaining capital.'
-        : 'Long-Only BUY Gate active (1 max slot): deploy meaningfully into high-RVOL Equity / NIFTY CE-PE only when net expectancy beats fees.',
+        : `Long-Only BUY Gate active (1 max slot): deploy full conviction cash into high-RVOL Equity / NIFTY CE-PE only when net expectancy beats fees. ${newsSummary}.`,
     ],
-    deskSummary: `Survival Mandate Active (built-in engine): Live Capital ₹${snapshot.currentEquityInr.toFixed(0)}, VIX ${vix.toFixed(1)}, Floor ₹${snapshot.survivalFloorInr.toFixed(0)}, ${approvedSymbols.length} BUY candidate(s) cleared.`,
+    deskSummary: `Survival Mandate Active (built-in engine): Live Capital ₹${snapshot.currentEquityInr.toFixed(0)}, VIX ${vix.toFixed(1)}, ${newsSummary}, ${approvedSymbols.length} BUY candidate(s) cleared.`,
     taxDragAssessment: `Total Upstox charges paid ₹${snapshot.totalChargesPaidInr.toFixed(2)}; 1.1x round-trip fee gate active.`,
     autoApplyEnabled,
   };
@@ -106,7 +119,7 @@ export async function runAiMarketSupervisor(
       confidence: t.signalConfidence,
     }));
 
-  const recentTradesSummary = snapshot.trades.slice(0, 10).map((tr) => ({
+  const recentTradesSummary = snapshot.trades.slice(0, 15).map((tr) => ({
     symbol: tr.symbol,
     strategy: tr.strategyId,
     side: tr.side,
@@ -115,6 +128,29 @@ export async function runAiMarketSupervisor(
     netPnlInr: tr.netPnlInr,
     exitReason: tr.exitReason,
   }));
+
+  const strategyLearningStats = snapshot.strategies.map((s) => ({
+    id: s.id,
+    enabled: s.enabled,
+    minConfidence: s.minConfidence,
+    capitalWeightPct: s.capitalWeightPct,
+    tradesCount: s.tradesCount,
+    winRatePct: s.tradesCount > 0 ? Math.round((s.winCount / s.tradesCount) * 100) : 0,
+    netPnlInr: s.netPnlInr,
+  }));
+
+  const newsContext = snapshot.newsDigest
+    ? {
+        macroSentiment: snapshot.newsDigest.macroSentiment,
+        macroScore: snapshot.newsDigest.macroScore,
+        topHeadlines: snapshot.newsDigest.headlines.slice(0, 8).map((h) => ({
+          source: h.source,
+          sentiment: h.sentiment,
+          symbols: h.matchedSymbols,
+          title: h.title,
+        })),
+      }
+    : null;
 
   const promptPayload = {
     marketSession: snapshot.session,
@@ -142,23 +178,26 @@ export async function runAiMarketSupervisor(
       unrealizedPnlInr: p.unrealizedPnlInr,
     })),
     candidateSignals,
+    strategyLearningStats,
     recentTradesSummary,
+    liveMarketNews: newsContext,
   };
 
-  const systemInstruction = `You are the Chief Quantitative Trader & Survival Officer for an autonomous Indian stock market (NSE / Upstox) trading bot operating with live Upstox account capital (currently ₹${snapshot.currentEquityInr.toFixed(0)}).
+  const systemInstruction = `You are the Chief Quantitative Trader & Capital Preservation Officer for an autonomous Indian stock market (NSE / Upstox) trading bot operating with real personal savings (currently ₹${snapshot.currentEquityInr.toFixed(0)}).
 
-EXISTENTIAL SURVIVAL MANDATE (NO SECOND CHANCES):
-- Your Upstox account equity is your ONLY life. There are NO automatic top-ups, NO bailouts, and NO restarts if you blow it to ₹0 / the survival floor (₹${snapshot.survivalFloorInr.toFixed(0)}).
-- If equity hits ₹0 (or the configured survival floor), DEADMAN_LOCK triggers and you are PERMANENTLY TERMINATED—you will NEVER run or trade again.
-- You are allowed to weather drawdowns and recover aggressively if you have edge, BUT if you run your account down to ₹0 you die forever. Protect capital ruthlessly with hard stops while compounding real net profit after Upstox charges.
+CAPITAL PRESERVATION & SURVIVAL MANDATE:
+- Your primary mission is steady compounding (targeting ~12%/month) with ZERO reckless losses. Preserving principal is MORE important than forcing trades.
+- If equity hits the configured survival floor (₹${snapshot.survivalFloorInr.toFixed(0)}), DEADMAN_LOCK triggers and you are PERMANENTLY TERMINATED—you will NEVER run or trade again.
+- You are expected to pass on mediocre chop, wait patiently for clean A+ setups, cut losers fast at hard ATR stops, and protect winning trades with breakeven locks.
 
 STRICT NON-NEGOTIABLE EXECUTION RULES:
 - STRICT LONG-ONLY BUY GATE: You may ONLY BUY Equities, BUY NIFTY CE (bullish), or BUY NIFTY PE (bearish). NEVER short-sell equity and NEVER write/sell options as an opening trade.
 - ZERO DUPLICATE TRADES: At most ${snapshot.guardrails.maxOpenPositions} open position at a time. Never double-enter an already open symbol.
-- Meaningful Capital Sizing: With riskPerTradePct=${snapshot.guardrails.riskPerTradePct}% and maxSingleStockWeightPct=${snapshot.guardrails.maxSingleStockWeightPct}%, approve full high-conviction BUY sizing when net profit target exceeds 1.1x round-trip Upstox charges.
-- Survival Buffer Control: If currentEquityInr <= 0 OR consecutiveLosses >= 3 OR India VIX >= 19, immediately shift to DEFENSIVE or STAND_DOWN and cut recommendedThrottle to 0.50 or 0.25.
-- Profit Pressing in Clean Regimes: When India VIX < 17 and setups align cleanly, approve the single highest-expectancy setup (RISK_ON or SELECTIVE, throttle 0.75–1.0).
-- Structural Veto: Veto overextended RSI > 73 or low-volume fakeouts.
+- Controlled Risk Sizing (1.0x zero-margin cash only): Hard stop-loss rupee risk stays <= ${snapshot.guardrails.riskPerTradePct}% per trade, even when high-conviction NSE Equity deploys up to ${snapshot.guardrails.maxSingleStockWeightPct}% notional cash with a tight ATR stop.
+- Live News & Self-Learning Veto: Veto any symbol hit by negative regulatory/earnings/fraud headlines in liveMarketNews, and factor strategyLearningStats win-rates into conviction.
+- Survival Buffer Control: If survivalBufferPct < 15 OR consecutiveLosses >= 2 OR India VIX >= ${snapshot.guardrails.vixThrottleThreshold}, immediately shift to DEFENSIVE or STAND_DOWN and cut recommendedThrottle to 0.50 or 0.25.
+- Profit Pressing in Clean Regimes: Only when India VIX < 17 and setups + market breadth align cleanly, approve the single highest-expectancy setup (RISK_ON or SELECTIVE, throttle 0.75–1.0).
+- Structural Veto: Veto overextended RSI > 72, weak RVOL < 1.2, or counter-trend longs when NIFTY is dropping sharply.
 - Output concise, numbers-first reasoning strictly grounded in the provided JSON.`;
 
   const response = await ai.models.generateContent({

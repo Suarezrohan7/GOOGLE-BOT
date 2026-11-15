@@ -108,11 +108,21 @@ export async function pollTelegramCommands(
       }
 
       const rawText = parsed.message.trim();
-      if (!rawText.startsWith('/')) continue;
-
-      const spaceIdx = rawText.search(/\s/);
-      const cmd = (spaceIdx === -1 ? rawText : rawText.slice(0, spaceIdx)).toLowerCase();
-      const argsText = spaceIdx === -1 ? '' : rawText.slice(spaceIdx + 1).trim();
+      let cmd = '';
+      let argsText = '';
+      if (rawText.startsWith('/')) {
+        const spaceIdx = rawText.search(/\s/);
+        cmd = (spaceIdx === -1 ? rawText : rawText.slice(0, spaceIdx)).toLowerCase();
+        argsText = spaceIdx === -1 ? '' : rawText.slice(spaceIdx + 1).trim();
+      } else if (rawText.includes('code=') && rawText.startsWith('http')) {
+        cmd = '/code';
+        argsText = rawText;
+      } else if (/^eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(rawText)) {
+        cmd = '/token';
+        argsText = rawText;
+      } else {
+        continue;
+      }
 
       const reply = await onCommand(cmd, argsText);
       if (reply) {

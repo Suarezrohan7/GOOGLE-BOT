@@ -28,6 +28,8 @@ export interface RiskCheckInput {
   recentOrderTimestamps: number[];
   indiaVix: number;
   canExecuteOrders: boolean;
+  signalConfidence?: number;
+  tradedTodaySymbols?: string[];
 }
 
 export interface RiskCheckResult {
@@ -161,7 +163,7 @@ export function evaluatePreTradeRisk(input: RiskCheckInput): RiskCheckResult {
     };
   }
 
-  // 5. Duplicate symbol check
+  // 5. Duplicate symbol check (active OR already bought & closed earlier today)
   if (openPositions.some((p) => p.symbol === ticker.symbol)) {
     return {
       decision: 'REJECTED',
@@ -169,6 +171,16 @@ export function evaluatePreTradeRisk(input: RiskCheckInput): RiskCheckResult {
       approvedQty: 0,
       rule: 'DUPLICATE_SYMBOL_GUARD',
       reason: `Active position already open in ${ticker.symbol}.`,
+    };
+  }
+
+  if (input.tradedTodaySymbols?.includes(ticker.symbol)) {
+    return {
+      decision: 'REJECTED',
+      approved: false,
+      approvedQty: 0,
+      rule: 'NO_SAME_DAY_REENTRY',
+      reason: `${ticker.symbol} was already traded today; same-day re-entry blocked for clean diversification.`,
     };
   }
 
@@ -222,13 +234,21 @@ export function evaluatePreTradeRisk(input: RiskCheckInput): RiskCheckResult {
   const instrumentType: InstrumentType = input.instrumentType || 'EQUITY';
   const isOptionBuy = instrumentType === 'OPTION_CE' || instrumentType === 'OPTION_PE';
   const lotSize = Math.max(1, input.lotSize || 1);
+  const conviction = input.signalConfidence ?? ticker.signalConfidence ?? 65;
 
   const vixMultiplier = indiaVix >= guardrails.vixThrottleThreshold ? 0.5 : 1.0;
-  const maxRiskInr =
-    currentEquityInr * (guardrails.riskPerTradePct / 100) * vixMultiplier;
+  // On A+ Equity setups (>=80 confidence, calm VIX), allow 1.25x headroom; enforce ₹1,000–₹2,000 stop-risk envelope when capital supports it
+  const convictionRiskBoost =
+    !isOptionBuy && conviction >= 80 && indiaVix < guardrails.vixThrottleThreshold ? 1.25 : 1.0;
+  const pctRiskInr = currentEquityInr * (guardrails.riskPerTradePct / 100);
+  const clampedDollarRiskInr =
+    currentEquityInr >= 4000
+      ? Math.min(2000, Math.max(1000, pctRiskInr))
+      : Math.max(250, pctRiskInr);
+  const maxRiskInr = clampedDollarRiskInr * vixMultiplier * convictionRiskBoost;
   const riskCappedQty = Math.floor(maxRiskInr / stopDistance);
 
-  // Single-stock weight cap (also filters out single-share prices too large for ₹10K capital)
+  // Single-position cap (defaults to 100% of live equity for high-conviction 1-slot cash deployment)
   const maxStockNotionalInr =
     currentEquityInr * (guardrails.maxSingleStockWeightPct / 100);
   const weightCappedQty = Math.floor(maxStockNotionalInr / ticker.ltp);
@@ -243,13 +263,16 @@ export function evaluatePreTradeRisk(input: RiskCheckInput): RiskCheckResult {
   );
 
   if (isOptionBuy) {
-    const lotCost = ticker.ltp * lotSize;
     const lotMaxStopRisk = stopDistance * lotSize;
-    const lotsAffordable = Math.floor(
-      Math.min(requestedQty, weightCappedQty, marginCappedQty) / lotSize
-    );
-    const withinDailyLoss = lotMaxStopRisk <= maxDailyLossInr;
-    approvedQty = lotsAffordable >= 1 && lotCost <= maxStockNotionalInr && withinDailyLoss ? lotSize : 0;
+    const requestedLots = Math.max(1, Math.floor(requestedQty / lotSize));
+    const affordableLots = Math.floor(Math.min(weightCappedQty, marginCappedQty) / lotSize);
+    const maxLotsByRisk = Math.max(0, Math.floor(maxRiskInr / Math.max(1, lotMaxStopRisk)));
+    const maxLotsByDailyLoss =
+      guardrails.maxDailyLossPct >= 100
+        ? Number.MAX_SAFE_INTEGER
+        : Math.max(0, Math.floor(maxDailyLossInr / Math.max(1, lotMaxStopRisk)));
+    const lotsApproved = Math.min(requestedLots, affordableLots, maxLotsByRisk, maxLotsByDailyLoss);
+    approvedQty = lotsApproved >= 1 ? lotsApproved * lotSize : 0;
   }
 
   if (approvedQty < lotSize) {

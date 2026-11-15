@@ -1,6 +1,6 @@
-import { useState } from 'react';
-import { ArrowRight, Brain, RefreshCw, ShieldAlert } from 'lucide-react';
-import type { BotStateSnapshot } from '../shared/types';
+import { useEffect, useState } from 'react';
+import { ArrowRight, Brain, Download, RefreshCw, ShieldAlert } from 'lucide-react';
+import type { BotStateSnapshot, TradeRecord } from '../shared/types';
 import { formatInr, formatSignedInr, formatSignedPct, formatTimeShort } from '../utils/format';
 import { AlphaScatterPlot } from './AlphaScatterPlot';
 import { EquityCurveChart } from './EquityCurveChart';
@@ -24,6 +24,26 @@ export function OverviewView({
 }: OverviewViewProps) {
   const [syncing, setSyncing] = useState(false);
   const [syncNote, setSyncNote] = useState<string | null>(null);
+  const [historyTrades, setHistoryTrades] = useState<TradeRecord[]>([]);
+  const [tradeFilter, setTradeFilter] = useState<'ALL' | 'WINS' | 'LOSSES'>('ALL');
+  const [tradeSearch, setTradeSearch] = useState('');
+
+  useEffect(() => {
+    let active = true;
+    fetch('/api/trades/history?limit=250')
+      .then((r) => (r.ok ? r.json() : null))
+      .then((data: { trades?: TradeRecord[] } | null) => {
+        if (active && Array.isArray(data?.trades)) {
+          setHistoryTrades(data.trades);
+        }
+      })
+      .catch(() => {
+        // Non-fatal fallback to state.trades
+      });
+    return () => {
+      active = false;
+    };
+  }, [state.trades.length]);
 
   const handleQuickSync = async () => {
     setSyncing(true);
@@ -72,7 +92,7 @@ export function OverviewView({
     {
       label: '03. 11-Gate Long-Only Risk',
       metric: `${approvedAudits} Pass · ${blockedAudits} Cut`,
-      sub: `BUY Only · ${state.guardrails.riskPerTradePct}% Stop`,
+      sub: `BUY Only · ${state.guardrails.riskPerTradePct}% (₹1k-₹2k)`,
       active: state.status === 'RUNNING',
     },
     {
@@ -81,17 +101,74 @@ export function OverviewView({
         ? `${state.aiSupervisor.regimeAssessment} (${state.aiThrottleMultiplier}x)`
         : 'Auto 60s Cadence',
       sub: state.aiSupervisor
-        ? `${state.aiSupervisor.vetoedSymbols.length} Vetoed · No Key Needed`
-        : 'Built-in Deterministic',
+        ? `${state.aiSupervisor.vetoedSymbols.length} Vetoed · News + AI`
+        : 'Built-in + ET/Mint News',
       active: Boolean(state.aiSupervisor),
     },
     {
       label: '05. Upstox HFT Router',
       metric: state.upstoxConnected ? 'LIVE MONEY ARMED' : 'LOCKED (NO TOKEN)',
-      sub: `${state.positions.length}/${state.guardrails.maxOpenPositions} Active Slot`,
+      sub: `${state.positions.length}/${state.guardrails.maxOpenPositions} Concurrent Slots`,
       active: state.positions.length > 0,
     },
   ];
+
+  const mergedTradeMap = new Map<string, TradeRecord>();
+  for (const t of historyTrades) mergedTradeMap.set(t.id, t);
+  for (const t of state.trades) mergedTradeMap.set(t.id, t);
+  const allTrades = Array.from(mergedTradeMap.values()).sort(
+    (a, b) => new Date(b.closedAt).getTime() - new Date(a.closedAt).getTime()
+  );
+
+  const filteredTrades = allTrades.filter((tr) => {
+    if (tradeFilter === 'WINS' && tr.netPnlInr <= 0) return false;
+    if (tradeFilter === 'LOSSES' && tr.netPnlInr > 0) return false;
+    if (tradeSearch.trim()) {
+      const q = tradeSearch.trim().toUpperCase();
+      return tr.symbol.toUpperCase().includes(q) || tr.strategyId.toUpperCase().includes(q);
+    }
+    return true;
+  });
+
+  const exportTradesCsv = () => {
+    const header = [
+      'ID',
+      'ClosedIST',
+      'Symbol',
+      'Strategy',
+      'Side',
+      'Qty',
+      'EntryPrice',
+      'ExitPrice',
+      'GrossPnlInr',
+      'ChargesInr',
+      'NetPnlInr',
+      'ExitReason',
+    ].join(',');
+    const rows = allTrades.map((t) =>
+      [
+        t.id,
+        t.closedAt,
+        t.symbol,
+        t.strategyId,
+        t.side,
+        t.qty,
+        t.entryPrice,
+        t.exitPrice,
+        t.grossPnlInr,
+        t.chargesInr,
+        t.netPnlInr,
+        t.exitReason,
+      ].join(',')
+    );
+    const blob = new Blob([[header, ...rows].join('\n')], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `artha-quant-trade-history-${state.session.istDateStr}.csv`;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
 
   const sectorRows = Array.from(new Set(state.tickers.map((t) => t.sector))).map((sector) => {
     const stocks = state.tickers.filter((t) => t.sector === sector);
@@ -301,7 +378,7 @@ export function OverviewView({
             </span>
           </div>
 
-          <EquityCurveChart points={state.equityCurve} height={225} />
+          <EquityCurveChart points={state.equityCurve} trades={allTrades} height={225} />
         </div>
 
         {/* Right: Gemini AI Risk Supervisor */}
@@ -583,25 +660,64 @@ export function OverviewView({
           </div>
         </div>
 
-        <div className="lg:col-span-7 bg-[#0C121D] border border-slate-800 rounded overflow-hidden">
-          <div className="px-4 py-3 border-b border-slate-800 flex items-center justify-between">
-            <h2 className="text-sm font-semibold text-slate-100">
-              Executed Live Upstox Trades (Net of STT &amp; GST)
-            </h2>
-            <span className="text-xs font-mono tabular-nums text-slate-300">
-              Realized {formatSignedInr(state.totalRealizedPnlInr)}
-            </span>
+        <div className="lg:col-span-7 bg-[#0C121D] border border-slate-800 rounded overflow-hidden flex flex-col">
+          <div className="px-4 py-3 border-b border-slate-800 flex flex-wrap items-center justify-between gap-2">
+            <div>
+              <h2 className="text-sm font-semibold text-slate-100">
+                Trade History Log ({filteredTrades.length}/{allTrades.length})
+              </h2>
+              <div className="text-[11px] font-mono tabular-nums text-slate-400">
+                Realized Net: <span className={state.totalRealizedPnlInr >= 0 ? 'text-emerald-400' : 'text-rose-400'}>{formatSignedInr(state.totalRealizedPnlInr)}</span>
+              </div>
+            </div>
+
+            <div className="flex flex-wrap items-center gap-2">
+              <input
+                type="text"
+                placeholder="Filter symbol..."
+                value={tradeSearch}
+                onChange={(e) => setTradeSearch(e.target.value)}
+                className="px-2 py-1 text-[11px] font-mono bg-[#070B12] border border-slate-700 rounded text-slate-200 w-28"
+              />
+              <div className="flex items-center gap-0.5 bg-[#070B12] border border-slate-800 rounded p-0.5">
+                {(['ALL', 'WINS', 'LOSSES'] as const).map((f) => (
+                  <button
+                    key={f}
+                    type="button"
+                    onClick={() => setTradeFilter(f)}
+                    className={`px-2 py-0.5 text-[10px] font-mono rounded cursor-pointer ${
+                      tradeFilter === f
+                        ? 'bg-slate-800 text-slate-100'
+                        : 'text-slate-400 hover:text-slate-200'
+                    }`}
+                  >
+                    {f}
+                  </button>
+                ))}
+              </div>
+              {allTrades.length > 0 && (
+                <button
+                  type="button"
+                  onClick={exportTradesCsv}
+                  className="inline-flex items-center gap-1 px-2 py-1 text-[10px] font-mono bg-slate-800 hover:bg-slate-700 text-slate-200 rounded cursor-pointer"
+                >
+                  <Download className="w-3 h-3" />
+                  CSV
+                </button>
+              )}
+            </div>
           </div>
 
-          {state.trades.length === 0 ? (
+          {filteredTrades.length === 0 ? (
             <div className="p-6 text-center text-xs text-slate-400">
-              No live Upstox round-trip trades executed yet.
+              No live Upstox round-trip trades recorded yet. Every completed trade persists to{' '}
+              <span className="font-mono text-slate-300">data/trade-history.jsonl</span>.
             </div>
           ) : (
-            <div className="overflow-x-auto">
+            <div className="overflow-x-auto max-h-[320px] overflow-y-auto">
               <table className="w-full text-left border-collapse text-xs">
-                <thead>
-                  <tr className="border-b border-slate-800 bg-[#090E17] text-slate-400 font-medium">
+                <thead className="sticky top-0 bg-[#090E17] z-10">
+                  <tr className="border-b border-slate-800 text-slate-400 font-medium">
                     <th className="py-2 px-3">IST</th>
                     <th className="py-2 px-2">Symbol</th>
                     <th className="py-2 px-2 text-right">Qty</th>
@@ -612,19 +728,15 @@ export function OverviewView({
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-800/70">
-                  {state.trades.slice(0, 7).map((tr) => (
+                  {filteredTrades.map((tr) => (
                     <tr key={tr.id} className="hover:bg-slate-800/30">
-                      <td className="py-2 px-3 font-mono tabular-nums text-slate-400">
+                      <td className="py-2 px-3 font-mono tabular-nums text-slate-400 whitespace-nowrap">
                         {formatTimeShort(tr.closedAt)}
                       </td>
                       <td className="py-2 px-2 font-semibold text-slate-100">
                         {tr.symbol}{' '}
-                        <span
-                          className={`font-mono text-[10px] ${
-                            tr.side === 'BUY' ? 'text-emerald-400' : 'text-rose-400'
-                          }`}
-                        >
-                          {tr.side}
+                        <span className="font-mono text-[10px] text-slate-400">
+                          {tr.strategyId}
                         </span>
                       </td>
                       <td className="py-2 px-2 text-right font-mono tabular-nums text-slate-300">

@@ -10,3 +10,4 @@ data/
 *.pem
 *.key
 public/assets/aistudio/
+.auto-pull-runner.sh

@@ -218,6 +218,22 @@ export interface StaticIpInfo {
   notes: string;
 }
 
+export interface NewsHeadlineInfo {
+  source: 'ET Markets' | 'Livemint';
+  title: string;
+  pubDate: string;
+  sentiment: 'BULLISH' | 'NEUTRAL' | 'BEARISH';
+  matchedSymbols: string[];
+}
+
+export interface MarketNewsDigestInfo {
+  fetchedAt: string | null;
+  macroSentiment: 'BULLISH' | 'NEUTRAL' | 'BEARISH';
+  macroScore: number;
+  headlines: NewsHeadlineInfo[];
+  symbolBias: Record<string, { score: number; headline: string }>;
+}
+
 export interface BotStateSnapshot {
   status: EngineStatus;
   activeBroker: BrokerId;
@@ -260,6 +276,7 @@ export interface BotStateSnapshot {
   aiSupervisor: AiSupervisorReport | null;
   aiThrottleMultiplier: number;
   staticIp: StaticIpInfo;
+  newsDigest?: MarketNewsDigestInfo | null;
 }
 
 export interface BacktestRequest {

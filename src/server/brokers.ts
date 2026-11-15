@@ -89,6 +89,7 @@ export async function executeLiveUpstoxOrder(
         trigger_price: 0,
         is_amo: false,
       }),
+      signal: AbortSignal.timeout(7000),
     });
 
     const json = (await resp.json()) as {
@@ -111,22 +112,25 @@ export async function executeLiveUpstoxOrder(
 
     const orderId = json.data.order_id;
     let executedPrice = round2(req.referencePrice);
-    let filledQty = req.qty;
+    let filledQty = 0;
+    let finalOrdStatus = '';
 
-    // Poll Upstox order details briefly to verify fill price & catch exchange rejections
-    for (let attempt = 0; attempt < 2; attempt++) {
+    // Poll Upstox order details to confirm actual exchange fill before booking position
+    const maxAttempts = useMarketOrder ? 4 : 4;
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
       try {
         if (attempt > 0) {
-          await new Promise((r) => setTimeout(r, 400));
+          await new Promise((r) => setTimeout(r, 350));
         }
         const detailResp = await fetch(
-          `https://api.upstox.com/v2/order/details?order_id=${encodeURIComponent(orderId)}`,
+          `https://api-hft.upstox.com/v2/order/details?order_id=${encodeURIComponent(orderId)}`,
           {
             method: 'GET',
             headers: {
               Authorization: `Bearer ${upstoxToken}`,
               Accept: 'application/json',
             },
+            signal: AbortSignal.timeout(5000),
           }
         );
         if (detailResp.ok) {
@@ -138,8 +142,8 @@ export async function executeLiveUpstoxOrder(
               status_message?: string;
             };
           };
-          const ordStatus = String(detailJson.data?.status || '').toLowerCase();
-          if (ordStatus === 'rejected' || ordStatus === 'cancelled') {
+          finalOrdStatus = String(detailJson.data?.status || '').toLowerCase();
+          if (finalOrdStatus === 'rejected' || finalOrdStatus === 'cancelled') {
             return {
               orderId,
               executedPrice: req.referencePrice,
@@ -147,7 +151,7 @@ export async function executeLiveUpstoxOrder(
               chargesInr: 0,
               status: 'REJECTED',
               message:
-                detailJson.data?.status_message || `Upstox order ${orderId} ${ordStatus}.`,
+                detailJson.data?.status_message || `Upstox order ${orderId} ${finalOrdStatus}.`,
             };
           }
           if (detailJson.data?.average_price && detailJson.data.average_price > 0) {
@@ -156,13 +160,44 @@ export async function executeLiveUpstoxOrder(
           if (detailJson.data?.filled_quantity && detailJson.data.filled_quantity > 0) {
             filledQty = Number(detailJson.data.filled_quantity);
           }
-          if (ordStatus === 'complete') {
+          if (finalOrdStatus === 'complete' && filledQty > 0) {
             break;
           }
         }
       } catch {
-        // Keep optimistic check if transient network glitch on status poll
+        // Retry on transient poll glitch
       }
+    }
+
+    // If an opening LIMIT order did not fill immediately, cancel it cleanly instead of booking a phantom position
+    if (!useMarketOrder && finalOrdStatus !== 'complete' && filledQty === 0) {
+      try {
+        await fetch(
+          `https://api-hft.upstox.com/v2/order/cancel?order_id=${encodeURIComponent(orderId)}`,
+          {
+            method: 'DELETE',
+            headers: {
+              Authorization: `Bearer ${upstoxToken}`,
+              Accept: 'application/json',
+            },
+            signal: AbortSignal.timeout(5000),
+          }
+        );
+      } catch {
+        // Best-effort cancel
+      }
+      return {
+        orderId,
+        executedPrice: req.referencePrice,
+        qty: 0,
+        chargesInr: 0,
+        status: 'REJECTED',
+        message: `Entry limit order ${orderId} remained ${finalOrdStatus || 'open'} after collar window; auto-cancelled safely.`,
+      };
+    }
+
+    if (filledQty <= 0) {
+      filledQty = req.qty;
     }
 
     const costs = calculateIndianTransactionCosts(

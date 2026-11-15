@@ -43,17 +43,18 @@ export function AuditArchitectureView({ state }: AuditArchitectureViewProps) {
             <div className="font-semibold text-emerald-400">01. Long-Only Survival Firewall</div>
             <p className="mt-1.5 text-slate-400 leading-relaxed">
               11 deterministic pre-trade checks run on the Express server before any Upstox order
-              leaves: Long-Only BUY Gate (zero short selling), Single Open Slot (no duplicates),
-              Dead-Man Floor, Daily Max Loss, ATR Sizing, and VWAP Price Collar.
+              leaves: Long-Only BUY Gate (zero short selling), Up to 3 Concurrent Slots with No
+              Same-Day Re-entry (never buys the same stock twice in a day), 25% Survival Floor,
+              ₹1,000–₹2,000 ATR Sizing, and VWAP Price Collar.
             </p>
           </div>
 
           <div className="bg-[#090E17] border border-slate-800 rounded p-3.5">
             <div className="font-semibold text-amber-400">02. Self-Healing &amp; Fee Cover</div>
             <p className="mt-1.5 text-slate-400 leading-relaxed">
-              Deploys up to 95% of live synced Upstox capital per high-conviction BUY trade (expected
-              profit &gt; 1.1x round-trip Upstox fees) with automated 3s position reconciliation,
-              urgent MARKET stop exits, and automatic IST daily rollover.
+              Allocates 1.0x Cash-Only capital across diversified signals (max 60% per stock,
+              expected profit &gt; 1.1x round-trip Upstox fees) with +0.60R fee-covered breakeven
+              locks, automated 3s position reconciliation, and urgent MARKET stop exits.
             </p>
           </div>
 
