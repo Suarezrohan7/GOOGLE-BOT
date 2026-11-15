@@ -3,6 +3,7 @@ import {
   Activity,
   Cpu,
   FlaskConical,
+  ListOrdered,
   Menu,
   OctagonAlert,
   Pause,
@@ -23,11 +24,13 @@ import { BacktestView } from './components/BacktestView';
 import { GuardrailsView } from './components/GuardrailsView';
 import { OverviewView } from './components/OverviewView';
 import { StrategiesView } from './components/StrategiesView';
+import { TradeLogView } from './components/TradeLogView';
 
-type TabId = 'overview' | 'strategies' | 'guardrails' | 'backtest' | 'audit';
+type TabId = 'overview' | 'tradelog' | 'strategies' | 'guardrails' | 'backtest' | 'audit';
 
 const NAV_ITEMS: Array<{ id: TabId; label: string; icon: typeof Activity }> = [
   { id: 'overview', label: 'Terminal Overview', icon: Activity },
+  { id: 'tradelog', label: 'Trade Log', icon: ListOrdered },
   { id: 'strategies', label: 'Strategies & NSE Tape', icon: Cpu },
   { id: 'guardrails', label: 'Guardrails & Upstox', icon: SlidersHorizontal },
   { id: 'backtest', label: 'Upstox V3 Backtest', icon: FlaskConical },
@@ -418,6 +421,7 @@ export default function App() {
                   onSyncUpstox={handleSyncUpstoxQuotes}
                 />
               )}
+              {activeTab === 'tradelog' && <TradeLogView state={state} />}
               {activeTab === 'strategies' && (
                 <StrategiesView state={state} onUpdateStrategy={handleUpdateStrategy} />
               )}
