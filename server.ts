@@ -25,6 +25,10 @@ async function startServer(): Promise<void> {
   const app = express();
   app.set('trust proxy', true);
   app.use(express.json({ limit: '1mb' }));
+  app.use('/api', (_req, res, next) => {
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
+    next();
+  });
 
   const engine = new TradingEngine();
 
@@ -332,8 +336,9 @@ async function startServer(): Promise<void> {
     app.use(vite.middlewares);
   } else {
     const distPath = path.resolve(process.cwd(), 'dist');
-    app.use(express.static(distPath));
+    app.use(express.static(distPath, { index: false, maxAge: '7d' }));
     app.get('/{*splat}', (_req, res) => {
+      res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
       res.sendFile(path.join(distPath, 'index.html'));
     });
   }

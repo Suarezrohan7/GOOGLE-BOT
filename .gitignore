@@ -11,3 +11,4 @@ data/
 *.key
 public/assets/aistudio/
 .auto-pull-runner.sh
+package-lock.json

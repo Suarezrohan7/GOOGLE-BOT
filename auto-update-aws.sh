@@ -22,9 +22,13 @@ LOCAL=$(git rev-parse HEAD)
 REMOTE=$(git rev-parse origin/main)
 if [ "$LOCAL" != "$REMOTE" ]; then
   echo "[Artha AutoDeploy] New commit $REMOTE detected; pulling & rebuilding..."
-  git pull --ff-only origin main
-  npm install --legacy-peer-deps --no-audit --no-fund
-  NODE_OPTIONS="--max-old-space-size=384" npm run build
+  PREV_PKG=$(sha256sum package.json | awk '{print $1}')
+  git reset --hard origin/main
+  NEW_PKG=$(sha256sum package.json | awk '{print $1}')
+  if [ "$PREV_PKG" != "$NEW_PKG" ] || [ ! -d node_modules ]; then
+    npm install --legacy-peer-deps --no-audit --no-fund --no-save
+  fi
+  NODE_OPTIONS="--max-old-space-size=320" npm run build
   sudo systemctl restart artha-quant
   echo "[Artha AutoDeploy] Restarted artha-quant cleanly."
 fi
