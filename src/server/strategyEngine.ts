@@ -2012,7 +2012,7 @@ export class TradingEngine {
       if (
         this.state.status === 'DEADMAN_LOCK' ||
         this.state.status === 'HALTED_DAILY_LOSS' ||
-        this.state.status === 'PAUSED'
+        (this.state.status === 'PAUSED' && this.state.positions.length === 0)
       ) {
         return;
       }
@@ -2043,12 +2043,14 @@ export class TradingEngine {
           }
         }
         const prevStatus = this.state.status;
-        this.state.status = 'AWAITING_MARKET_OPEN';
-        this.state.statusReason = session.isHoliday
-          ? `NSE Holiday (${session.holidayName}). Live trading resumes next NSE trading day at 09:15 IST.`
-          : session.isWeekend
-            ? 'Weekend market closure (Sat/Sun). Live trading resumes Monday 09:15 IST.'
-            : `Market ${session.phase}. Live Upstox orders armed for 09:15–${this.state.guardrails.autoSquareoffIst} IST.`;
+        if (this.state.status !== 'PAUSED') {
+          this.state.status = 'AWAITING_MARKET_OPEN';
+          this.state.statusReason = session.isHoliday
+            ? `NSE Holiday (${session.holidayName}). Live trading resumes next NSE trading day at 09:15 IST.`
+            : session.isWeekend
+              ? 'Weekend market closure (Sat/Sun). Live trading resumes Monday 09:15 IST.'
+              : `Market ${session.phase}. Live Upstox orders armed for 09:15–${this.state.guardrails.autoSquareoffIst} IST.`;
+        }
         if (prevStatus !== this.state.status || this.state.tickCount % 20 === 0) {
           this.persistState();
         }
@@ -2059,7 +2061,12 @@ export class TradingEngine {
       await this.warmUpUniverseIfNeeded(session.istDateStr);
       await this.syncUpstoxAccountAndQuotes();
 
-      if (
+      if (this.state.status === 'PAUSED') {
+        // Keep entries paused while still monitoring stops/targets/15:05 squareoff below
+      } else if (session.phase === 'SQUAREOFF_WINDOW') {
+        this.state.status = 'SQUAREOFF_WINDOW';
+        this.state.statusReason = `${this.state.guardrails.autoSquareoffIst} IST MIS auto-squareoff window active (exiting before broker RMS cutoff).`;
+      } else if (
         this.state.status === 'COOLDOWN' &&
         this.state.cooldownUntil &&
         Date.now() >= new Date(this.state.cooldownUntil).getTime()
@@ -2070,14 +2077,11 @@ export class TradingEngine {
         this.state.statusReason = 'Cooldown elapsed; autonomous Upstox execution active.';
       } else if (
         this.state.status === 'AWAITING_UPSTOX_TOKEN' ||
-        this.state.status === 'AWAITING_MARKET_OPEN'
+        this.state.status === 'AWAITING_MARKET_OPEN' ||
+        this.state.status === 'SQUAREOFF_WINDOW'
       ) {
-        this.state.status =
-          session.phase === 'SQUAREOFF_WINDOW' ? 'SQUAREOFF_WINDOW' : 'RUNNING';
-        this.state.statusReason =
-          session.phase === 'SQUAREOFF_WINDOW'
-            ? `${this.state.guardrails.autoSquareoffIst} IST MIS auto-squareoff window active (exiting before broker RMS cutoff).`
-            : 'Live NSE session active — autonomous Upstox execution running.';
+        this.state.status = 'RUNNING';
+        this.state.statusReason = 'Live NSE session active — autonomous Upstox execution running.';
       }
 
       // Automatically run Quant Regime Supervisor every 60s (built-in deterministic engine needs zero API keys; optional Gemini upgrade if key present)
