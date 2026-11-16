@@ -1457,6 +1457,10 @@ export class TradingEngine {
       await this.closePosition(item.pos.id, item.reason);
     }
 
+    if (isSquareoffWindow) {
+      await this.sweepLiveUpstoxMisPositions();
+    }
+
     const eq = this.computeEquityMetrics();
     if (eq.currentEquity > this.state.peakEquityInr) {
       this.state.peakEquityInr = eq.currentEquity;
@@ -1779,11 +1783,47 @@ export class TradingEngine {
     );
   }
 
+  private async sweepLiveUpstoxMisPositions(): Promise<void> {
+    const livePosRes = await fetchUpstoxPositions();
+    if (!livePosRes.ok) return;
+    for (const lp of livePosRes.positions) {
+      if (lp.quantity > 0 && lp.product.toUpperCase() === 'I' && lp.instrumentToken) {
+        const fill = await executeLiveUpstoxOrder({
+          symbol: lp.symbol || lp.instrumentToken,
+          instrumentToken: lp.instrumentToken,
+          instrumentType: lp.instrumentToken.startsWith('NSE_FO|') ? 'OPTION_CE' : 'EQUITY',
+          exchange: 'NSE',
+          side: 'SELL',
+          qty: lp.quantity,
+          referencePrice: lp.lastPrice > 0 ? lp.lastPrice : lp.averagePrice,
+          productType: 'MIS',
+          urgentExit: true,
+        });
+        this.addRiskAudit({
+          symbol: lp.symbol || lp.instrumentToken,
+          side: 'SELL',
+          requestedQty: lp.quantity,
+          approvedQty: fill.status === 'COMPLETE' ? fill.qty : 0,
+          strategyId: 'ORB_VWAP',
+          decision: fill.status === 'COMPLETE' ? 'APPROVED' : 'REJECTED',
+          rule: 'UPSTOX_MIS_BROKER_SWEEP',
+          reason: fill.message,
+        });
+        if (fill.status === 'COMPLETE') {
+          void sendTelegramAlert(
+            `MIS BROKER SWEEP CLOSED: ${lp.symbol || lp.instrumentToken} x ${fill.qty} @ ₹${fill.executedPrice.toFixed(2)}`
+          );
+        }
+      }
+    }
+  }
+
   public async flattenAllPositions(reason: TradeRecord['exitReason']): Promise<void> {
     const ids = this.state.positions.map((p) => p.id);
     for (const id of ids) {
       await this.closePosition(id, reason);
     }
+    await this.sweepLiveUpstoxMisPositions();
   }
 
   private addRiskAudit(entry: Omit<RiskAuditEntry, 'id' | 'timestamp'>): void {
@@ -2087,8 +2127,14 @@ export class TradingEngine {
         this.state.statusReason = 'Live NSE session active — autonomous Upstox execution running.';
       }
 
+      // Prioritize exit stops, targets, and 15:00 IST squareoff BEFORE any AI supervisor call
+      const safeToTrade = await this.manageOpenPositionsAndBreakers(
+        session.phase === 'SQUAREOFF_WINDOW'
+      );
+
       // Automatically run Quant Regime Supervisor every 60s (built-in deterministic engine needs zero API keys; optional Gemini upgrade if key present)
       if (
+        safeToTrade &&
         this.state.status === 'RUNNING' &&
         Date.now() - this.lastAiRunMs >= 60_000
       ) {
@@ -2098,10 +2144,6 @@ export class TradingEngine {
           // Non-fatal; 11-gate risk firewall still guards capital
         }
       }
-
-      const safeToTrade = await this.manageOpenPositionsAndBreakers(
-        session.phase === 'SQUAREOFF_WINDOW'
-      );
 
       if (safeToTrade && this.state.status === 'RUNNING') {
         await this.evaluateNewEntries(session.canExecuteOrders, session.indiaVix);

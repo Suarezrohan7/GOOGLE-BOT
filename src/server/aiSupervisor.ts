@@ -200,67 +200,77 @@ STRICT NON-NEGOTIABLE EXECUTION RULES:
 - Structural Veto: Veto overextended RSI > 72, weak RVOL < 1.2, or counter-trend longs when NIFTY is dropping sharply.
 - Output concise, numbers-first reasoning strictly grounded in the provided JSON.`;
 
-  const response = await ai.models.generateContent({
-    model: MODEL_NAME,
-    contents: `Evaluate current NSE portfolio and signal slate:\n${JSON.stringify(promptPayload)}`,
-    config: {
-      systemInstruction,
-      thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
-      responseMimeType: 'application/json',
-      responseSchema: {
-        type: Type.OBJECT,
-        properties: {
-          regimeAssessment: {
-            type: Type.STRING,
-            description: 'One of: RISK_ON, SELECTIVE, DEFENSIVE, STAND_DOWN',
-          },
-          recommendedThrottle: {
-            type: Type.NUMBER,
-            description: 'Position size scalar between 0.25 and 1.0',
-          },
-          convictionScore: {
-            type: Type.INTEGER,
-            description: 'Integer 0-100 reflecting setup quality and survival headroom',
-          },
-          approvedSymbols: {
-            type: Type.ARRAY,
-            items: { type: Type.STRING },
-            description: 'Symbols cleared for entry',
-          },
-          vetoedSymbols: {
-            type: Type.ARRAY,
-            items: { type: Type.STRING },
-            description: 'Symbols vetoed due to noise, correlation, or VIX risk',
-          },
-          recommendedActions: {
-            type: Type.ARRAY,
-            items: { type: Type.STRING },
-            description: '2 to 4 concrete risk or strategy actions',
-          },
-          deskSummary: {
-            type: Type.STRING,
-            description: '2-3 sentence institutional risk & market regime summary',
-          },
-          taxDragAssessment: {
-            type: Type.STRING,
-            description: '1-2 sentence assessment of STT/brokerage/slippage drag vs gross PnL',
+  let rawText = '{}';
+  try {
+    const timeoutPromise = new Promise<never>((_, reject) =>
+      setTimeout(() => reject(new Error('AI Supervisor 8s timeout')), 8000)
+    );
+    const response = await Promise.race([
+      ai.models.generateContent({
+        model: MODEL_NAME,
+        contents: `Evaluate current NSE portfolio and signal slate:\n${JSON.stringify(promptPayload)}`,
+        config: {
+          systemInstruction,
+          thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+          responseMimeType: 'application/json',
+          responseSchema: {
+            type: Type.OBJECT,
+            properties: {
+              regimeAssessment: {
+                type: Type.STRING,
+                description: 'One of: RISK_ON, SELECTIVE, DEFENSIVE, STAND_DOWN',
+              },
+              recommendedThrottle: {
+                type: Type.NUMBER,
+                description: 'Position size scalar between 0.25 and 1.0',
+              },
+              convictionScore: {
+                type: Type.INTEGER,
+                description: 'Integer 0-100 reflecting setup quality and survival headroom',
+              },
+              approvedSymbols: {
+                type: Type.ARRAY,
+                items: { type: Type.STRING },
+                description: 'Symbols cleared for entry',
+              },
+              vetoedSymbols: {
+                type: Type.ARRAY,
+                items: { type: Type.STRING },
+                description: 'Symbols vetoed due to noise, correlation, or VIX risk',
+              },
+              recommendedActions: {
+                type: Type.ARRAY,
+                items: { type: Type.STRING },
+                description: '2 to 4 concrete risk or strategy actions',
+              },
+              deskSummary: {
+                type: Type.STRING,
+                description: '2-3 sentence institutional risk & market regime summary',
+              },
+              taxDragAssessment: {
+                type: Type.STRING,
+                description: '1-2 sentence assessment of STT/brokerage/slippage drag vs gross PnL',
+              },
+            },
+            required: [
+              'regimeAssessment',
+              'recommendedThrottle',
+              'convictionScore',
+              'approvedSymbols',
+              'vetoedSymbols',
+              'recommendedActions',
+              'deskSummary',
+              'taxDragAssessment',
+            ],
           },
         },
-        required: [
-          'regimeAssessment',
-          'recommendedThrottle',
-          'convictionScore',
-          'approvedSymbols',
-          'vetoedSymbols',
-          'recommendedActions',
-          'deskSummary',
-          'taxDragAssessment',
-        ],
-      },
-    },
-  });
-
-  const rawText = (response.text ?? '{}').trim();
+      }),
+      timeoutPromise,
+    ]);
+    rawText = (response.text ?? '{}').trim();
+  } catch {
+    return runBuiltInQuantSupervisor(snapshot, autoApplyEnabled);
+  }
   const parsed = JSON.parse(rawText) as Partial<AiSupervisorReport>;
 
   const validRegimes = ['RISK_ON', 'SELECTIVE', 'DEFENSIVE', 'STAND_DOWN'] as const;
