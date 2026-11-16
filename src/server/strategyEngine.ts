@@ -78,7 +78,7 @@ const DEFAULT_GUARDRAILS: GuardrailsConfig = {
   consecutiveLossCooldownCount: 3,
   cooldownMinutes: 30,
   vixThrottleThreshold: 18.0,
-  autoSquareoffIst: '15:05',
+  autoSquareoffIst: '15:00',
   slippageBps: 5,
   productType: 'MIS',
   allowIndexOptions: true,
@@ -316,6 +316,12 @@ export class TradingEngine {
               lastQuoteAt: null,
             };
           });
+          if (
+            parsed.guardrails.autoSquareoffIst === '15:15' ||
+            parsed.guardrails.autoSquareoffIst === '15:05'
+          ) {
+            parsed.guardrails.autoSquareoffIst = '15:00';
+          }
           // Apply user-calibrated multi-slot & 25% survival defaults on fresh/zero-trade deployments
           if (parsed.trades.length === 0 && parsed.positions.length === 0) {
             if (
@@ -329,9 +335,6 @@ export class TradingEngine {
               parsed.guardrails.maxDailyLossPct === 6
             ) {
               parsed.guardrails.maxDailyLossPct = 100.0;
-            }
-            if (parsed.guardrails.autoSquareoffIst === '15:15') {
-              parsed.guardrails.autoSquareoffIst = '15:05';
             }
             if (
               parsed.guardrails.riskPerTradePct === 5 ||

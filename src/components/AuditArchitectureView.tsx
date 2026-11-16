@@ -71,7 +71,7 @@ export function AuditArchitectureView({ state }: AuditArchitectureViewProps) {
             <div className="font-semibold text-slate-100">04. NSE Official Calendar &amp; AWS IP</div>
             <p className="mt-1.5 text-slate-400 leading-relaxed">
               Synchronizes official NSE trading holidays and IST market phases (09:00 Pre-Open,
-              09:15 Live, 15:05 MIS Auto-Squareoff, 15:30 Close) with AWS static IP readiness for
+              09:15 Live, 15:00 MIS Auto-Squareoff, 15:30 Close) with AWS static IP readiness for
               Upstox HFT execution.
             </p>
           </div>
