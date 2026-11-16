@@ -177,6 +177,8 @@ export class TradingEngine {
   private warmedUpIstDate: string | null = null;
   private isWarmingUp = false;
   private recentOrderTimestamps: number[] = [];
+  private orderRejectedUntilMs: Map<string, number> = new Map();
+  private marginCooldownUntilMs = 0;
   private timer: NodeJS.Timeout | null = null;
   private isStepping = false;
   private lastStepStartedAtMs = 0;
@@ -637,19 +639,19 @@ export class TradingEngine {
       this.state.upstoxAccountError = null;
       this.state.upstoxLastSyncAt = new Date().toISOString();
 
-      // Always reflect exact live Upstox equity (deposits/withdrawals appear within 3-15s)
+      // Always reflect exact live Upstox free cash (available_margin already deducts realized intraday losses)
       if (this.state.positions.length === 0) {
-        this.state.guardrails.allocatedCapitalInr = liveTotal;
-        this.state.initialCapitalInr = round2(liveTotal - this.state.realizedPnlInr);
+        this.state.guardrails.allocatedCapitalInr = liveAvail;
+        this.state.initialCapitalInr = round2(liveAvail - this.state.realizedPnlInr);
         if (this.state.trades.length === 0 || liveTotal > this.state.peakEquityInr) {
-          this.state.peakEquityInr = liveTotal;
+          this.state.peakEquityInr = Math.max(this.state.peakEquityInr, liveAvail, liveTotal);
         }
         if (this.state.equityCurve.length <= 1) {
           this.state.equityCurve = [
             {
               timestamp: this.state.upstoxLastSyncAt,
               label: 'Live',
-              equityInr: liveTotal,
+              equityInr: liveAvail,
               drawdownPct: 0,
               survivalFloorInr: computeSurvivalFloor(
                 this.state.peakEquityInr,
@@ -662,7 +664,7 @@ export class TradingEngine {
 
       if (prevAvail === null || Math.abs(liveAvail - prevAvail) >= 1) {
         void sendTelegramAlert(
-          `Upstox Live Balance Synced: Available ₹${liveAvail.toLocaleString('en-IN')} | Total Equity ₹${liveTotal.toLocaleString('en-IN')}`
+          `Upstox Live Balance Synced: Available ₹${liveAvail.toLocaleString('en-IN')} | Day Start ₹${liveTotal.toLocaleString('en-IN')}`
         );
       }
     } else if (!funds.ok) {
@@ -746,25 +748,167 @@ export class TradingEngine {
       }
     }
 
-    // 3. Self-healing live broker position reconciliation (matches both equity symbol and option instrumentKey)
-    if (this.state.positions.length > 0) {
-      const livePosRes = await fetchUpstoxPositions();
-      if (livePosRes.ok) {
-        const activeKeys = new Set<string>();
-        for (const p of livePosRes.positions) {
-          if (p.quantity > 0) {
-            if (p.symbol) activeKeys.add(p.symbol.toUpperCase());
-            if (p.instrumentToken) activeKeys.add(p.instrumentToken);
-          }
-        }
-        const orphanPositions = this.state.positions.filter(
+    // 3. Broker-authoritative live Upstox position adoption & closed-trade reconciliation
+    const livePosRes = await fetchUpstoxPositions();
+    if (livePosRes.ok) {
+      const activeKeys = new Set<string>();
+      const dayList = livePosRes.dayPositions ?? livePosRes.positions;
+      const todayIst = this.getIstClock().istDateStr;
+
+      // 3a. Adopt or qty-sync any open LONG positions currently live on Upstox
+      for (const lp of livePosRes.positions) {
+        if (lp.quantity <= 0) continue;
+        const symUpper = lp.symbol.toUpperCase();
+        if (symUpper) activeKeys.add(symUpper);
+        if (lp.instrumentToken) activeKeys.add(lp.instrumentToken);
+
+        const existing = this.state.positions.find(
           (p) =>
-            !activeKeys.has(p.symbol.toUpperCase()) &&
-            !(p.instrumentKey && activeKeys.has(p.instrumentKey))
+            p.symbol.toUpperCase() === symUpper ||
+            (lp.instrumentToken && p.instrumentKey === lp.instrumentToken)
         );
-        for (const orphan of orphanPositions) {
-          this.reconcileClosedPosition(orphan.id, 'SIGNAL_EXIT');
+        const liveEntry = round2(
+          lp.averagePrice > 0 ? lp.averagePrice : lp.dayBuyPrice > 0 ? lp.dayBuyPrice : lp.lastPrice
+        );
+        const liveCur = round2(lp.lastPrice > 0 ? lp.lastPrice : liveEntry);
+
+        if (existing) {
+          if (existing.qty !== lp.quantity && liveEntry > 0) {
+            existing.qty = lp.quantity;
+            existing.entryPrice = liveEntry;
+          }
+          if (liveCur > 0) existing.currentPrice = liveCur;
+        } else if (liveEntry > 0) {
+          const ticker = this.state.tickers.find((t) => t.symbol.toUpperCase() === symUpper);
+          const meta = NSE_UNIVERSE.find((u) => u.symbol === symUpper);
+          const isOpt = lp.instrumentToken.startsWith('NSE_FO|');
+          const prod: 'MIS' | 'CNC' = lp.product.toUpperCase() === 'D' ? 'CNC' : 'MIS';
+          const atr = ticker?.atr14 && ticker.atr14 > 0 ? ticker.atr14 : round2(liveEntry * 0.01);
+          const stopDist = round2(Math.max(atr * 1.15, liveEntry * 0.008));
+          const stopLoss = round2(Math.max(1, liveEntry - stopDist));
+          const takeProfit = round2(liveEntry + Math.max(atr * 2.2, stopDist * 1.8));
+          const instType: InstrumentType = isOpt ? 'OPTION_CE' : 'EQUITY';
+          const entryCharges = calculateIndianTransactionCosts(
+            liveEntry,
+            lp.quantity,
+            'BUY',
+            prod,
+            instType
+          ).totalChargesInr;
+
+          this.state.positions.push({
+            id: `UPX-ADOPT-${Date.now()}-${symUpper}`,
+            symbol: symUpper,
+            instrumentKey: lp.instrumentToken || resolveUpstoxInstrumentKey(symUpper),
+            instrumentType: instType,
+            sector: meta?.sector || 'Banking',
+            side: 'BUY',
+            qty: lp.quantity,
+            entryPrice: liveEntry,
+            currentPrice: liveCur,
+            stopLoss,
+            trailingStop: null,
+            takeProfit,
+            strategyId: 'ORB_VWAP',
+            productType: prod,
+            entryChargesInr: entryCharges,
+            unrealizedPnlInr: round2((liveCur - liveEntry) * lp.quantity - entryCharges),
+            riskAmountInr: round2(stopDist * lp.quantity),
+            openedAt: new Date().toISOString(),
+          });
+          this.addRiskAudit({
+            symbol: symUpper,
+            side: 'BUY',
+            requestedQty: lp.quantity,
+            approvedQty: lp.quantity,
+            strategyId: 'ORB_VWAP',
+            decision: 'APPROVED',
+            rule: 'UPSTOX_POSITION_ADOPTED',
+            reason: `Synced live Upstox position: ${lp.quantity} ${symUpper} @ ₹${liveEntry.toFixed(2)} (SL ₹${stopLoss.toFixed(1)}, Target ₹${takeProfit.toFixed(1)}).`,
+          });
+          void sendTelegramAlert(
+            `SYNCED LIVE UPSTOX POSITION: ${symUpper} x ${lp.quantity} @ ₹${liveEntry.toFixed(2)}\nSL ₹${stopLoss.toFixed(1)} | Target ₹${takeProfit.toFixed(1)}`
+          );
         }
+      }
+
+      // 3b. Reconcile any bot-tracked position that is no longer open on Upstox (manual exit / RMS)
+      const orphanPositions = this.state.positions.filter(
+        (p) =>
+          !activeKeys.has(p.symbol.toUpperCase()) &&
+          !(p.instrumentKey && activeKeys.has(p.instrumentKey))
+      );
+      for (const orphan of orphanPositions) {
+        const closedMatch = dayList.find(
+          (d) =>
+            d.quantity === 0 &&
+            (d.symbol.toUpperCase() === orphan.symbol.toUpperCase() ||
+              (orphan.instrumentKey && d.instrumentToken === orphan.instrumentKey))
+        );
+        this.reconcileClosedPosition(orphan.id, 'SIGNAL_EXIT', closedMatch);
+      }
+
+      // 3c. Backfill today's closed Upstox intraday trades not yet recorded in state.trades (manual / pre-adoption exits)
+      for (const dp of dayList) {
+        if (dp.quantity !== 0 || dp.dayBuyQty <= 0 || dp.daySellQty <= 0) continue;
+        const symUpper = dp.symbol.toUpperCase();
+        const alreadyLoggedToday = this.state.trades.some((tr) => {
+          if (tr.symbol.toUpperCase() !== symUpper) return false;
+          const trIst = new Intl.DateTimeFormat('en-CA', {
+            timeZone: 'Asia/Kolkata',
+            year: 'numeric',
+            month: '2-digit',
+            day: '2-digit',
+          }).format(new Date(tr.closedAt));
+          return trIst === todayIst;
+        });
+        if (alreadyLoggedToday) continue;
+
+        const meta = NSE_UNIVERSE.find((u) => u.symbol === symUpper);
+        const prod: 'MIS' | 'CNC' = dp.product.toUpperCase() === 'D' ? 'CNC' : 'MIS';
+        const isOpt = dp.instrumentToken.startsWith('NSE_FO|');
+        const instType: InstrumentType = isOpt ? 'OPTION_CE' : 'EQUITY';
+        const entryPx = round2(dp.dayBuyPrice > 0 ? dp.dayBuyPrice : dp.lastPrice);
+        const exitPx = round2(dp.daySellPrice > 0 ? dp.daySellPrice : dp.lastPrice);
+        const qty = Math.min(dp.dayBuyQty, dp.daySellQty);
+        const entryChg = calculateIndianTransactionCosts(entryPx, qty, 'BUY', prod, instType).totalChargesInr;
+        const exitChg = calculateIndianTransactionCosts(exitPx, qty, 'SELL', prod, instType).totalChargesInr;
+        const totalCharges = round2(entryChg + exitChg);
+        const grossPnlInr = round2((exitPx - entryPx) * qty);
+        const netPnlInr =
+          dp.realizedPnl !== 0 ? round2(dp.realizedPnl - totalCharges) : round2(grossPnlInr - totalCharges);
+
+        this.state.realizedPnlInr = round2(this.state.realizedPnlInr + netPnlInr);
+        this.state.dailyPnlInr = round2(this.state.dailyPnlInr + netPnlInr);
+        this.state.totalChargesPaidInr = round2(this.state.totalChargesPaidInr + totalCharges);
+
+        const syncedTrade: TradeRecord = {
+          id: `TRD-UPX-${todayIst}-${symUpper}`,
+          symbol: symUpper,
+          instrumentType: instType,
+          sector: meta?.sector || 'Banking',
+          side: 'BUY',
+          qty,
+          entryPrice: entryPx,
+          exitPrice: exitPx,
+          strategyId: 'ORB_VWAP',
+          productType: prod,
+          grossPnlInr,
+          chargesInr: totalCharges,
+          netPnlInr,
+          exitReason: 'SIGNAL_EXIT',
+          openedAt: new Date().toISOString(),
+          closedAt: new Date().toISOString(),
+        };
+        this.state.trades.unshift(syncedTrade);
+        this.appendTradeHistoryLog(syncedTrade);
+      }
+
+      if (this.state.positions.length === 0 && this.state.upstoxLiveBalanceInr !== null) {
+        this.state.guardrails.allocatedCapitalInr = this.state.upstoxLiveBalanceInr;
+        this.state.initialCapitalInr = round2(
+          this.state.upstoxLiveBalanceInr - this.state.realizedPnlInr
+        );
       }
     }
 
@@ -1525,12 +1669,16 @@ export class TradingEngine {
 
   private reconcileClosedPosition(
     positionId: string,
-    exitReason: TradeRecord['exitReason']
+    exitReason: TradeRecord['exitReason'],
+    brokerClosed?: { daySellPrice: number; realizedPnl: number }
   ): void {
     const idx = this.state.positions.findIndex((p) => p.id === positionId);
     if (idx === -1) return;
     const pos = this.state.positions[idx];
-    const exitPrice = pos.currentPrice;
+    const exitPrice =
+      brokerClosed && brokerClosed.daySellPrice > 0
+        ? round2(brokerClosed.daySellPrice)
+        : pos.currentPrice;
     const instType: InstrumentType = pos.instrumentType || 'EQUITY';
     const exitCharges = calculateIndianTransactionCosts(
       exitPrice,
@@ -1540,7 +1688,10 @@ export class TradingEngine {
       instType
     ).totalChargesInr;
 
-    const grossPnlInr = round2((exitPrice - pos.entryPrice) * pos.qty);
+    const grossPnlInr =
+      brokerClosed && brokerClosed.realizedPnl !== 0
+        ? round2(brokerClosed.realizedPnl)
+        : round2((exitPrice - pos.entryPrice) * pos.qty);
     const totalCharges = round2(pos.entryChargesInr + exitCharges);
     const netPnlInr = round2(grossPnlInr - totalCharges);
 
@@ -2360,6 +2511,8 @@ export class TradingEngine {
     }
 
     // 2. Otherwise evaluate Long-Only Equity BUY signals across up to maxOpenPositions slots (never duplicate same symbol same day)
+    if (Date.now() < this.marginCooldownUntilMs) return;
+
     const candidates = this.state.tickers
       .filter((t) => t.ltp > 0 && t.signal !== null && t.signalSide === 'BUY')
       .sort((a, b) => b.signalConfidence - a.signalConfidence);
@@ -2370,8 +2523,15 @@ export class TradingEngine {
       if (this.state.positions.length >= this.state.guardrails.maxOpenPositions) {
         break;
       }
+      if (Date.now() < (this.orderRejectedUntilMs.get(top.symbol) ?? 0)) {
+        continue;
+      }
       const liveEq = this.computeEquityMetrics();
-      if (liveEq.availableMargin < top.ltp) {
+      const effectiveAvailableMargin =
+        this.state.upstoxLiveBalanceInr !== null
+          ? Math.min(liveEq.availableMargin, this.state.upstoxLiveBalanceInr)
+          : liveEq.availableMargin;
+      if (effectiveAvailableMargin < top.ltp) {
         continue;
       }
 
@@ -2446,7 +2606,7 @@ export class TradingEngine {
       let requestedQty = riskBasedQty;
       if (top.signalConfidence >= 80 && indiaVix < this.state.guardrails.vixThrottleThreshold) {
         const cashShare = Math.min(1.0, 0.55 + ((top.signalConfidence - 80) / 15) * 0.45) * aiScalar;
-        const convictionQty = Math.floor((liveEq.availableMargin * cashShare) / top.ltp);
+        const convictionQty = Math.floor((effectiveAvailableMargin * cashShare) / top.ltp);
         requestedQty = Math.max(riskBasedQty, convictionQty);
       }
 
@@ -2462,7 +2622,7 @@ export class TradingEngine {
         strategyId: strat.id,
         currentEquityInr: liveEq.currentEquity,
         peakEquityInr: this.state.peakEquityInr,
-        availableMarginInr: liveEq.availableMargin,
+        availableMarginInr: effectiveAvailableMargin,
         dailyPnlInr: this.state.dailyPnlInr + liveEq.unrealizedPnl,
         openPositions: this.state.positions,
         recentOrderTimestamps: this.recentOrderTimestamps,
@@ -2498,6 +2658,10 @@ export class TradingEngine {
       });
 
       if (fill.status !== 'COMPLETE') {
+        this.orderRejectedUntilMs.set(top.symbol, Date.now() + 180_000);
+        if (/need to add|insufficient|margin/i.test(fill.message)) {
+          this.marginCooldownUntilMs = Date.now() + 60_000;
+        }
         this.addRiskAudit({
           symbol: top.symbol,
           side,

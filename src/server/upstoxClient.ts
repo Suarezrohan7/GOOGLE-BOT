@@ -489,11 +489,17 @@ export interface UpstoxOpenPosition {
   averagePrice: number;
   lastPrice: number;
   pnl: number;
+  dayBuyQty: number;
+  dayBuyPrice: number;
+  daySellQty: number;
+  daySellPrice: number;
+  realizedPnl: number;
 }
 
 export async function fetchUpstoxPositions(): Promise<{
   ok: boolean;
   positions: UpstoxOpenPosition[];
+  dayPositions?: UpstoxOpenPosition[];
   error?: string;
 }> {
   const token = getUpstoxAccessToken();
@@ -524,6 +530,13 @@ export async function fetchUpstoxPositions(): Promise<{
         average_price?: number;
         last_price?: number;
         pnl?: number;
+        realised?: number;
+        day_buy_quantity?: number;
+        day_buy_price?: number;
+        buy_price?: number;
+        day_sell_quantity?: number;
+        day_sell_price?: number;
+        sell_price?: number;
       }>;
       errors?: Array<{ message?: string }>;
     };
@@ -536,8 +549,8 @@ export async function fetchUpstoxPositions(): Promise<{
       };
     }
 
-    const positions: UpstoxOpenPosition[] = (json.data ?? [])
-      .filter((p) => Number(p.quantity ?? 0) !== 0)
+    const mappedAll: UpstoxOpenPosition[] = (json.data ?? [])
+      .filter((p) => Number(p.quantity ?? 0) !== 0 || Number(p.day_buy_quantity ?? 0) > 0)
       .map((p) => ({
         symbol: String(p.trading_symbol || '').replace(/-EQ$/i, '').toUpperCase(),
         instrumentToken: String(p.instrument_token || ''),
@@ -546,9 +559,16 @@ export async function fetchUpstoxPositions(): Promise<{
         averagePrice: Number(p.average_price ?? 0),
         lastPrice: Number(p.last_price ?? 0),
         pnl: Number(p.pnl ?? 0),
+        dayBuyQty: Number(p.day_buy_quantity ?? 0),
+        dayBuyPrice: Number(p.day_buy_price ?? p.buy_price ?? 0),
+        daySellQty: Number(p.day_sell_quantity ?? 0),
+        daySellPrice: Number(p.day_sell_price ?? p.sell_price ?? 0),
+        realizedPnl: Number(p.realised ?? p.pnl ?? 0),
       }));
 
-    return { ok: true, positions };
+    const positions = mappedAll.filter((p) => p.quantity !== 0);
+
+    return { ok: true, positions, dayPositions: mappedAll };
   } catch (err) {
     return {
       ok: false,

@@ -116,11 +116,11 @@ export async function executeLiveUpstoxOrder(
     let finalOrdStatus = '';
 
     // Poll Upstox order details to confirm actual exchange fill before booking position
-    const maxAttempts = useMarketOrder ? 4 : 4;
+    const maxAttempts = useMarketOrder ? 5 : 6;
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
       try {
         if (attempt > 0) {
-          await new Promise((r) => setTimeout(r, 350));
+          await new Promise((r) => setTimeout(r, 400));
         }
         const detailResp = await fetch(
           `https://api-hft.upstox.com/v2/order/details?order_id=${encodeURIComponent(orderId)}`,
@@ -143,7 +143,16 @@ export async function executeLiveUpstoxOrder(
             };
           };
           finalOrdStatus = String(detailJson.data?.status || '').toLowerCase();
-          if (finalOrdStatus === 'rejected' || finalOrdStatus === 'cancelled') {
+          if (detailJson.data?.average_price && detailJson.data.average_price > 0) {
+            executedPrice = round2(detailJson.data.average_price);
+          }
+          if (detailJson.data?.filled_quantity && detailJson.data.filled_quantity > 0) {
+            filledQty = Number(detailJson.data.filled_quantity);
+          }
+          if (
+            (finalOrdStatus === 'rejected' || finalOrdStatus === 'cancelled') &&
+            filledQty === 0
+          ) {
             return {
               orderId,
               executedPrice: req.referencePrice,
@@ -154,12 +163,6 @@ export async function executeLiveUpstoxOrder(
                 detailJson.data?.status_message || `Upstox order ${orderId} ${finalOrdStatus}.`,
             };
           }
-          if (detailJson.data?.average_price && detailJson.data.average_price > 0) {
-            executedPrice = round2(detailJson.data.average_price);
-          }
-          if (detailJson.data?.filled_quantity && detailJson.data.filled_quantity > 0) {
-            filledQty = Number(detailJson.data.filled_quantity);
-          }
           if (finalOrdStatus === 'complete' && filledQty > 0) {
             break;
           }
@@ -169,7 +172,7 @@ export async function executeLiveUpstoxOrder(
       }
     }
 
-    // If an opening LIMIT order did not fill immediately, cancel it cleanly instead of booking a phantom position
+    // If an opening LIMIT order is still unconfirmed, attempt cancel then RE-CHECK order/details so a late exchange fill is NEVER reported as REJECTED
     if (!useMarketOrder && finalOrdStatus !== 'complete' && filledQty === 0) {
       try {
         await fetch(
@@ -183,17 +186,46 @@ export async function executeLiveUpstoxOrder(
             signal: AbortSignal.timeout(5000),
           }
         );
+        await new Promise((r) => setTimeout(r, 250));
+        const verifyResp = await fetch(
+          `https://api-hft.upstox.com/v2/order/details?order_id=${encodeURIComponent(orderId)}`,
+          {
+            method: 'GET',
+            headers: {
+              Authorization: `Bearer ${upstoxToken}`,
+              Accept: 'application/json',
+            },
+            signal: AbortSignal.timeout(5000),
+          }
+        );
+        if (verifyResp.ok) {
+          const verifyJson = (await verifyResp.json()) as {
+            data?: { average_price?: number; status?: string; filled_quantity?: number };
+          };
+          const vStatus = String(verifyJson.data?.status || '').toLowerCase();
+          const vFilled = Number(verifyJson.data?.filled_quantity ?? 0);
+          if (vFilled > 0) {
+            filledQty = vFilled;
+            finalOrdStatus = vStatus || 'complete';
+            if (verifyJson.data?.average_price && verifyJson.data.average_price > 0) {
+              executedPrice = round2(verifyJson.data.average_price);
+            }
+          }
+        }
       } catch {
-        // Best-effort cancel
+        // Best-effort cancel & verify
       }
-      return {
-        orderId,
-        executedPrice: req.referencePrice,
-        qty: 0,
-        chargesInr: 0,
-        status: 'REJECTED',
-        message: `Entry limit order ${orderId} remained ${finalOrdStatus || 'open'} after collar window; auto-cancelled safely.`,
-      };
+
+      if (filledQty === 0) {
+        return {
+          orderId,
+          executedPrice: req.referencePrice,
+          qty: 0,
+          chargesInr: 0,
+          status: 'REJECTED',
+          message: `Entry limit order ${orderId} remained ${finalOrdStatus || 'open'} after collar window; auto-cancelled safely.`,
+        };
+      }
     }
 
     if (filledQty <= 0) {
