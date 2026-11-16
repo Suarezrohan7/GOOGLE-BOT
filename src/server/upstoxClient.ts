@@ -136,6 +136,7 @@ export async function requestUpstoxAccessTokenViaNotifier(): Promise<{
           'Content-Type': 'application/json',
         },
         body: JSON.stringify({ client_secret: clientSecret }),
+        signal: AbortSignal.timeout(7000),
       }
     );
     const json = (await resp.json()) as {
@@ -367,6 +368,7 @@ export async function fetchUpstoxFunds(): Promise<{
           Authorization: `Bearer ${token}`,
           Accept: 'application/json',
         },
+        signal: AbortSignal.timeout(7000),
       }
     );
 
@@ -425,6 +427,7 @@ export async function fetchUpstoxNseQuotes(
         Authorization: `Bearer ${token}`,
         Accept: 'application/json',
       },
+      signal: AbortSignal.timeout(7000),
     });
 
     const json = (await resp.json()) as {
@@ -509,6 +512,7 @@ export async function fetchUpstoxPositions(): Promise<{
         Authorization: `Bearer ${token}`,
         Accept: 'application/json',
       },
+      signal: AbortSignal.timeout(7000),
     });
     const json = (await resp.json()) as {
       status?: string;
@@ -573,6 +577,7 @@ export async function fetchUpstoxIndexSnapshots(): Promise<{
     const resp = await fetch(url, {
       method: 'GET',
       headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' },
+      signal: AbortSignal.timeout(7000),
     });
     const json = (await resp.json()) as {
       status?: string;
@@ -776,6 +781,7 @@ export async function fetchUpstoxSingleQuote(
     const resp = await fetch(url, {
       method: 'GET',
       headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' },
+      signal: AbortSignal.timeout(7000),
     });
     const json = (await resp.json()) as {
       status?: string;
