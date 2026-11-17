@@ -27,7 +27,13 @@ export interface BrokerOrderResponse {
   message: string;
 }
 
-function roundToNseTick(price: number): number {
+function roundToNseTick(
+  price: number,
+  instrumentType: 'EQUITY' | 'OPTION_CE' | 'OPTION_PE' = 'EQUITY'
+): number {
+  if (instrumentType === 'EQUITY' && price >= 1000) {
+    return Math.round(price * 10) / 10;
+  }
   return Math.round(price * 20) / 20;
 }
 
@@ -63,11 +69,12 @@ export async function executeLiveUpstoxOrder(
   }
 
   const instrumentToken = req.instrumentToken || resolveUpstoxInstrumentKey(req.symbol);
+  const instType = req.instrumentType || 'EQUITY';
   const useMarketOrder = Boolean(req.urgentExit);
   const limitPrice =
     req.side === 'BUY'
-      ? roundToNseTick(req.referencePrice * 1.001)
-      : roundToNseTick(req.referencePrice * 0.999);
+      ? roundToNseTick(req.referencePrice * 1.001, instType)
+      : roundToNseTick(req.referencePrice * 0.999, instType);
 
   try {
     const resp = await fetch('https://api-hft.upstox.com/v2/order/place', {
@@ -116,7 +123,7 @@ export async function executeLiveUpstoxOrder(
     let finalOrdStatus = '';
 
     // Poll Upstox order details to confirm actual exchange fill before booking position
-    const maxAttempts = useMarketOrder ? 5 : 6;
+    const maxAttempts = useMarketOrder ? 5 : 8;
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
       try {
         if (attempt > 0) {
@@ -186,29 +193,32 @@ export async function executeLiveUpstoxOrder(
             signal: AbortSignal.timeout(5000),
           }
         );
-        await new Promise((r) => setTimeout(r, 250));
-        const verifyResp = await fetch(
-          `https://api-hft.upstox.com/v2/order/details?order_id=${encodeURIComponent(orderId)}`,
-          {
-            method: 'GET',
-            headers: {
-              Authorization: `Bearer ${upstoxToken}`,
-              Accept: 'application/json',
-            },
-            signal: AbortSignal.timeout(5000),
-          }
-        );
-        if (verifyResp.ok) {
-          const verifyJson = (await verifyResp.json()) as {
-            data?: { average_price?: number; status?: string; filled_quantity?: number };
-          };
-          const vStatus = String(verifyJson.data?.status || '').toLowerCase();
-          const vFilled = Number(verifyJson.data?.filled_quantity ?? 0);
-          if (vFilled > 0) {
-            filledQty = vFilled;
-            finalOrdStatus = vStatus || 'complete';
-            if (verifyJson.data?.average_price && verifyJson.data.average_price > 0) {
-              executedPrice = round2(verifyJson.data.average_price);
+        await new Promise((r) => setTimeout(r, 450));
+        for (const baseUrl of ['https://api-hft.upstox.com', 'https://api.upstox.com']) {
+          const verifyResp = await fetch(
+            `${baseUrl}/v2/order/details?order_id=${encodeURIComponent(orderId)}`,
+            {
+              method: 'GET',
+              headers: {
+                Authorization: `Bearer ${upstoxToken}`,
+                Accept: 'application/json',
+              },
+              signal: AbortSignal.timeout(5000),
+            }
+          );
+          if (verifyResp.ok) {
+            const verifyJson = (await verifyResp.json()) as {
+              data?: { average_price?: number; status?: string; filled_quantity?: number };
+            };
+            const vStatus = String(verifyJson.data?.status || '').toLowerCase();
+            const vFilled = Number(verifyJson.data?.filled_quantity ?? 0);
+            if (vFilled > 0) {
+              filledQty = vFilled;
+              finalOrdStatus = vStatus || 'complete';
+              if (verifyJson.data?.average_price && verifyJson.data.average_price > 0) {
+                executedPrice = round2(verifyJson.data.average_price);
+              }
+              break;
             }
           }
         }

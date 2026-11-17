@@ -183,6 +183,8 @@ export class TradingEngine {
   private isStepping = false;
   private lastStepStartedAtMs = 0;
   private lastAiRunMs = 0;
+  private lastAiAuditKey = '';
+  private lastAiAuditAtMs = 0;
   private lastNotifierPromptMs = 0;
   private staticIp: StaticIpInfo = {
     serverOutboundIp: null,
@@ -629,38 +631,19 @@ export class TradingEngine {
 
     // 1. Check live ₹ balance in Upstox SEC equity segment (Upstox Funds API sleeps 00:00–05:30 IST)
     let fundsMaintenance = false;
+    let syncedFundsAvail: number | null = null;
+    let syncedFundsTotal: number | null = null;
     const funds = await fetchUpstoxFunds();
     if (funds.ok && typeof funds.availableMarginInr === 'number') {
       const prevAvail = this.state.upstoxLiveBalanceInr;
       const liveAvail = round2(funds.availableMarginInr);
       const liveUsed = round2(funds.usedMarginInr ?? 0);
       const liveTotal = round2(liveAvail + liveUsed);
+      syncedFundsAvail = liveAvail;
+      syncedFundsTotal = liveTotal;
       this.state.upstoxLiveBalanceInr = liveAvail;
       this.state.upstoxAccountError = null;
       this.state.upstoxLastSyncAt = new Date().toISOString();
-
-      // Always reflect exact live Upstox free cash (available_margin already deducts realized intraday losses)
-      if (this.state.positions.length === 0) {
-        this.state.guardrails.allocatedCapitalInr = liveAvail;
-        this.state.initialCapitalInr = round2(liveAvail - this.state.realizedPnlInr);
-        if (this.state.trades.length === 0 || liveTotal > this.state.peakEquityInr) {
-          this.state.peakEquityInr = Math.max(this.state.peakEquityInr, liveAvail, liveTotal);
-        }
-        if (this.state.equityCurve.length <= 1) {
-          this.state.equityCurve = [
-            {
-              timestamp: this.state.upstoxLastSyncAt,
-              label: 'Live',
-              equityInr: liveAvail,
-              drawdownPct: 0,
-              survivalFloorInr: computeSurvivalFloor(
-                this.state.peakEquityInr,
-                this.state.guardrails.maxTotalDrawdownPct
-              ),
-            },
-          ];
-        }
-      }
 
       if (prevAvail === null || Math.abs(liveAvail - prevAvail) >= 1) {
         void sendTelegramAlert(
@@ -848,67 +831,101 @@ export class TradingEngine {
         this.reconcileClosedPosition(orphan.id, 'SIGNAL_EXIT', closedMatch);
       }
 
-      // 3c. Backfill today's closed Upstox intraday trades not yet recorded in state.trades (manual / pre-adoption exits)
-      for (const dp of dayList) {
-        if (dp.quantity !== 0 || dp.dayBuyQty <= 0 || dp.daySellQty <= 0) continue;
-        const symUpper = dp.symbol.toUpperCase();
-        const alreadyLoggedToday = this.state.trades.some((tr) => {
-          if (tr.symbol.toUpperCase() !== symUpper) return false;
-          const trIst = new Intl.DateTimeFormat('en-CA', {
-            timeZone: 'Asia/Kolkata',
-            year: 'numeric',
-            month: '2-digit',
-            day: '2-digit',
-          }).format(new Date(tr.closedAt));
-          return trIst === todayIst;
-        });
-        if (alreadyLoggedToday) continue;
+      // 3c. Backfill today's closed Upstox intraday trades not yet recorded in state.trades
+      // Guard: only backfill during/after live NSE open (>=09:15 IST) so previous-day unsettled Upstox rows at 00:00–09:14 IST are never double-counted
+      const syncClock = this.getIstClock();
+      if (syncClock.totalMins >= 9 * 60 + 15) {
+        for (const dp of dayList) {
+          if (dp.quantity !== 0 || dp.dayBuyQty <= 0 || dp.daySellQty <= 0) continue;
+          const symUpper = dp.symbol.toUpperCase();
+          const entryPx = round2(dp.dayBuyPrice > 0 ? dp.dayBuyPrice : dp.lastPrice);
+          const exitPx = round2(dp.daySellPrice > 0 ? dp.daySellPrice : dp.lastPrice);
+          const qty = Math.min(dp.dayBuyQty, dp.daySellQty);
 
-        const meta = NSE_UNIVERSE.find((u) => u.symbol === symUpper);
-        const prod: 'MIS' | 'CNC' = dp.product.toUpperCase() === 'D' ? 'CNC' : 'MIS';
-        const isOpt = dp.instrumentToken.startsWith('NSE_FO|');
-        const instType: InstrumentType = isOpt ? 'OPTION_CE' : 'EQUITY';
-        const entryPx = round2(dp.dayBuyPrice > 0 ? dp.dayBuyPrice : dp.lastPrice);
-        const exitPx = round2(dp.daySellPrice > 0 ? dp.daySellPrice : dp.lastPrice);
-        const qty = Math.min(dp.dayBuyQty, dp.daySellQty);
-        const entryChg = calculateIndianTransactionCosts(entryPx, qty, 'BUY', prod, instType).totalChargesInr;
-        const exitChg = calculateIndianTransactionCosts(exitPx, qty, 'SELL', prod, instType).totalChargesInr;
-        const totalCharges = round2(entryChg + exitChg);
-        const grossPnlInr = round2((exitPx - entryPx) * qty);
-        const netPnlInr =
-          dp.realizedPnl !== 0 ? round2(dp.realizedPnl - totalCharges) : round2(grossPnlInr - totalCharges);
+          const alreadyLogged = this.state.trades.some((tr) => {
+            if (tr.symbol.toUpperCase() !== symUpper) return false;
+            const trIst = new Intl.DateTimeFormat('en-CA', {
+              timeZone: 'Asia/Kolkata',
+              year: 'numeric',
+              month: '2-digit',
+              day: '2-digit',
+            }).format(new Date(tr.closedAt));
+            if (trIst === todayIst) return true;
+            const ageMs = Date.now() - new Date(tr.closedAt).getTime();
+            return (
+              ageMs < 18 * 60 * 60 * 1000 &&
+              tr.qty === qty &&
+              Math.abs(tr.entryPrice - entryPx) <= 0.05 &&
+              Math.abs(tr.exitPrice - exitPx) <= 0.05
+            );
+          });
+          if (alreadyLogged) continue;
 
-        this.state.realizedPnlInr = round2(this.state.realizedPnlInr + netPnlInr);
-        this.state.dailyPnlInr = round2(this.state.dailyPnlInr + netPnlInr);
-        this.state.totalChargesPaidInr = round2(this.state.totalChargesPaidInr + totalCharges);
+          const meta = NSE_UNIVERSE.find((u) => u.symbol === symUpper);
+          const prod: 'MIS' | 'CNC' = dp.product.toUpperCase() === 'D' ? 'CNC' : 'MIS';
+          const isOpt = dp.instrumentToken.startsWith('NSE_FO|');
+          const instType: InstrumentType = isOpt ? 'OPTION_CE' : 'EQUITY';
+          const entryChg = calculateIndianTransactionCosts(entryPx, qty, 'BUY', prod, instType).totalChargesInr;
+          const exitChg = calculateIndianTransactionCosts(exitPx, qty, 'SELL', prod, instType).totalChargesInr;
+          const totalCharges = round2(entryChg + exitChg);
+          const grossPnlInr = round2((exitPx - entryPx) * qty);
+          const netPnlInr =
+            dp.realizedPnl !== 0 ? round2(dp.realizedPnl - totalCharges) : round2(grossPnlInr - totalCharges);
 
-        const syncedTrade: TradeRecord = {
-          id: `TRD-UPX-${todayIst}-${symUpper}`,
-          symbol: symUpper,
-          instrumentType: instType,
-          sector: meta?.sector || 'Banking',
-          side: 'BUY',
-          qty,
-          entryPrice: entryPx,
-          exitPrice: exitPx,
-          strategyId: 'ORB_VWAP',
-          productType: prod,
-          grossPnlInr,
-          chargesInr: totalCharges,
-          netPnlInr,
-          exitReason: 'SIGNAL_EXIT',
-          openedAt: new Date().toISOString(),
-          closedAt: new Date().toISOString(),
-        };
-        this.state.trades.unshift(syncedTrade);
-        this.appendTradeHistoryLog(syncedTrade);
+          this.state.realizedPnlInr = round2(this.state.realizedPnlInr + netPnlInr);
+          this.state.dailyPnlInr = round2(this.state.dailyPnlInr + netPnlInr);
+          this.state.totalChargesPaidInr = round2(this.state.totalChargesPaidInr + totalCharges);
+
+          const syncedTrade: TradeRecord = {
+            id: `TRD-UPX-${todayIst}-${symUpper}`,
+            symbol: symUpper,
+            instrumentType: instType,
+            sector: meta?.sector || 'Banking',
+            side: 'BUY',
+            qty,
+            entryPrice: entryPx,
+            exitPrice: exitPx,
+            strategyId: 'ORB_VWAP',
+            productType: prod,
+            grossPnlInr,
+            chargesInr: totalCharges,
+            netPnlInr,
+            exitReason: 'SIGNAL_EXIT',
+            openedAt: new Date().toISOString(),
+            closedAt: new Date().toISOString(),
+          };
+          this.state.trades.unshift(syncedTrade);
+          this.appendTradeHistoryLog(syncedTrade);
+        }
       }
 
-      if (this.state.positions.length === 0 && this.state.upstoxLiveBalanceInr !== null) {
-        this.state.guardrails.allocatedCapitalInr = this.state.upstoxLiveBalanceInr;
-        this.state.initialCapitalInr = round2(
-          this.state.upstoxLiveBalanceInr - this.state.realizedPnlInr
-        );
+      // Only rebase initialCapitalInr from free cash when BOTH bot state and live Upstox have zero open positions
+      if (
+        this.state.positions.length === 0 &&
+        livePosRes.positions.length === 0 &&
+        this.state.upstoxLiveBalanceInr !== null
+      ) {
+        const liveAvail = syncedFundsAvail ?? this.state.upstoxLiveBalanceInr;
+        const liveTotal = syncedFundsTotal ?? liveAvail;
+        this.state.guardrails.allocatedCapitalInr = liveAvail;
+        this.state.initialCapitalInr = round2(liveAvail - this.state.realizedPnlInr);
+        if (this.state.trades.length === 0 || liveTotal > this.state.peakEquityInr) {
+          this.state.peakEquityInr = Math.max(this.state.peakEquityInr, liveAvail, liveTotal);
+        }
+        if (this.state.equityCurve.length <= 1) {
+          this.state.equityCurve = [
+            {
+              timestamp: this.state.upstoxLastSyncAt || new Date().toISOString(),
+              label: 'Live',
+              equityInr: liveAvail,
+              drawdownPct: 0,
+              survivalFloorInr: computeSurvivalFloor(
+                this.state.peakEquityInr,
+                this.state.guardrails.maxTotalDrawdownPct
+              ),
+            },
+          ];
+        }
       }
     }
 
@@ -1201,16 +1218,21 @@ export class TradingEngine {
       this.state.aiThrottleMultiplier =
         report.regimeAssessment === 'STAND_DOWN' ? 0.25 : report.recommendedThrottle;
     }
-    this.addRiskAudit({
-      symbol: 'AI_SUPERVISOR',
-      side: 'BUY',
-      requestedQty: 0,
-      approvedQty: 0,
-      strategyId: 'ORB_VWAP',
-      decision: report.regimeAssessment === 'STAND_DOWN' ? 'THROTTLED' : 'APPROVED',
-      rule: `SUPERVISOR_${report.regimeAssessment}`,
-      reason: `${report.model}: regime=${report.regimeAssessment}, throttle=${report.recommendedThrottle}x, vetoed=[${report.vetoedSymbols.join(', ') || 'none'}]`,
-    });
+    const auditKey = `${report.regimeAssessment}|${report.recommendedThrottle}|${report.vetoedSymbols.join(',')}`;
+    if (auditKey !== this.lastAiAuditKey || Date.now() - this.lastAiAuditAtMs >= 15 * 60_000) {
+      this.lastAiAuditKey = auditKey;
+      this.lastAiAuditAtMs = Date.now();
+      this.addRiskAudit({
+        symbol: 'AI_SUPERVISOR',
+        side: 'BUY',
+        requestedQty: 0,
+        approvedQty: 0,
+        strategyId: 'ORB_VWAP',
+        decision: report.regimeAssessment === 'STAND_DOWN' ? 'THROTTLED' : 'APPROVED',
+        rule: `SUPERVISOR_${report.regimeAssessment}`,
+        reason: `${report.model}: regime=${report.regimeAssessment}, throttle=${report.recommendedThrottle}x, vetoed=[${report.vetoedSymbols.join(', ') || 'none'}]`,
+      });
+    }
     this.persistState();
     return report;
   }
@@ -1254,11 +1276,16 @@ export class TradingEngine {
       this.state.upstoxLiveBalanceInr = liveAvail;
       this.state.upstoxAccountError = null;
       this.state.upstoxLastSyncAt = new Date().toISOString();
-      if (this.state.positions.length === 0) {
-        this.state.guardrails.allocatedCapitalInr = liveTotal;
-        this.state.initialCapitalInr = round2(liveTotal - this.state.realizedPnlInr);
+      const livePosRes = this.state.positions.length === 0 ? await fetchUpstoxPositions() : null;
+      if (
+        this.state.positions.length === 0 &&
+        livePosRes?.ok &&
+        livePosRes.positions.length === 0
+      ) {
+        this.state.guardrails.allocatedCapitalInr = liveAvail;
+        this.state.initialCapitalInr = round2(liveAvail - this.state.realizedPnlInr);
         if (this.state.trades.length === 0 || liveTotal > this.state.peakEquityInr) {
-          this.state.peakEquityInr = liveTotal;
+          this.state.peakEquityInr = Math.max(this.state.peakEquityInr, liveAvail, liveTotal);
         }
       }
       this.persistState();
